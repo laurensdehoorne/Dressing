@@ -715,7 +715,7 @@ def test_follow_up_adjusts_the_earlier_suggestion(client, monkeypatch):
 
     async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
         seen["question"] = content[-1]["text"]
-        return {"advies": "Andere schoenen.", "outfits": [{"titel": "Look", "stukken": [hemd["id"]], "waarom": "Past."}]}
+        return {"advies": "Andere schoenen.", "outfits": [{"titel": "Look", "stukken": [hemd["id"], sneakers["id"]], "waarom": "Past."}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
     r = client.post("/api/stylist", json={"query": "andere schoenen", "use_weather": False, "previous": {
         "queries": ["etentje", "iets chiquer"], "outfits": [{"title": "Smart casual", "item_ids": [hemd["id"], sneakers["id"]]}]}}, headers=H)
@@ -741,3 +741,48 @@ def test_stylist_knows_the_season(client, monkeypatch):
     assert f"Vandaag is het {date.today().isoformat()} ({claude.season(date.today())})." in seen["text"]
     assert "seizoen zomer" in seen["text"] and "Het seizoen:" in seen["system"]
     assert "niet het seizoen" not in seen["text"]  # at home the season counts
+
+
+def test_outfit_without_shoes_is_completed(client, monkeypatch):
+    hemd, broek = add(client, name="Wit hemd"), add(client, name="Zwarte broek", category="broek")
+    laarzen = add(client, name="Zwarte laarsjes", category="schoenen")
+    asked = []
+    answers = [
+        {"advies": "Eerst.", "outfits": [{"titel": "Zonder schoenen", "stukken": [hemd["id"], broek["id"], "LAARS-TYPFOUT"], "waarom": "."}]},
+        {"advies": "Verbeterd.", "outfits": [{"titel": "Met schoenen", "stukken": [hemd["id"], broek["id"], laarzen["id"]], "waarom": "."}]},
+    ]
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        asked.append(content[-1]["text"])
+        return answers[len(asked) - 1]
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    r = client.post("/api/stylist", json={"query": "etentje", "use_weather": False}, headers=H).json()
+    assert len(asked) == 2 and "geen schoenen" in asked[1] and "LAARS-TYPFOUT" in asked[1] and "Zwarte broek" in asked[1]
+    assert r["advice"] == "Verbeterd." and r["outfits"][0]["item_ids"] == [hemd["id"], broek["id"], laarzen["id"]]
+
+    # A second answer that is no better: the first one stays. A good first answer is asked once.
+    answers[1] = {"advies": "Niets.", "outfits": []}
+    asked.clear()
+    r = client.post("/api/stylist", json={"query": "etentje", "use_weather": False}, headers=H).json()
+    assert len(asked) == 2 and r["advice"] == "Eerst." and r["outfits"][0]["item_ids"] == [hemd["id"], broek["id"]]
+    answers[0] = answers[1] = {"advies": "Goed.", "outfits": [{"titel": "Ok", "stukken": [hemd["id"], laarzen["id"]], "waarom": "."}]}
+    asked.clear()
+    client.post("/api/stylist", json={"query": "etentje", "use_weather": False}, headers=H)
+    assert len(asked) == 1
+
+
+def test_follow_up_keeps_every_outfit(client, monkeypatch):
+    hemd, trui = add(client, name="Wit hemd"), add(client, name="Grijze trui", category="trui")
+    sneakers, laarzen = add(client, name="Sneakers", category="schoenen"), add(client, name="Laarzen", category="schoenen")
+    asked = []
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        asked.append(content[-1]["text"])
+        one = {"titel": "Een", "stukken": [hemd["id"], laarzen["id"]], "waarom": "."}
+        two = {"titel": "Twee", "stukken": [trui["id"], laarzen["id"]], "waarom": "."}
+        return {"advies": "", "outfits": [one] if len(asked) == 1 else [one, two]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    r = client.post("/api/stylist", json={"query": "andere schoenen", "use_weather": False, "previous": {"queries": ["etentje"], "outfits": [
+        {"title": "Een", "item_ids": [hemd["id"], sneakers["id"]]}, {"title": "Twee", "item_ids": [trui["id"], sneakers["id"]]}]}}, headers=H).json()
+    assert "Geef alle outfits uit je voorstel terug" in asked[0]
+    assert len(asked) == 2 and "had 2 outfits en je gaf er 1 terug" in asked[1] and len(r["outfits"]) == 2

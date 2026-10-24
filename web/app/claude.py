@@ -434,8 +434,9 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
             pieces = ", ".join(f"{i} ({names[i]})" for i in o.get("item_ids", []) if i in names)
             shown.append(f"Outfit {n} '{o.get('title') or ''}': {pieces}")
         question += f"\nEerder vroeg ik: {asked}\nJe stelde voor:\n" + "\n".join(shown)
-        question += ("\nIk stuur je voorstel bij. Pas het aan zoals ik vraag en houd wat ik niet vernoem; de eerdere vraag "
-                     "(gelegenheid, weer) blijft gelden.")
+        question += ("\nIk stuur je voorstel bij. Geef alle outfits uit je voorstel terug, in dezelfde volgorde, en pas in elk "
+                     "enkel aan wat ik vraag (gaat het over één outfit, bv. 'outfit 2', dan enkel dat). Houd wat ik niet vernoem; "
+                     "de eerdere vraag (gelegenheid, weer) blijft gelden.")
         question += f"\nBijsturing: {query}"
     else:
         question += f"\nVraag: {query}"
@@ -443,16 +444,44 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
     content = [{"type": "text", "text": wardrobe, "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": question}]
     report(step="Outfits samenstellen")
     got = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=content, helpers=helpers))
-    known = {i["id"] for i in available}
-    outfits = []
+    by_id = {i["id"]: i for i in available}
+    outfits, problems = _outfits(got, by_id, len((previous or {}).get("outfits") or []))
+    if problems:
+        # Asked once more with what is wrong (the dressing is cached, so this costs little); kept when it is better.
+        report(step="Outfits nakijken")
+        shown = "\n".join(f"Outfit {n} '{o['title']}': " + ", ".join(f"{i} ({names[i]})" for i in o["item_ids"])
+                          for n, o in enumerate(outfits, 1)) or "geen bruikbare outfits"
+        fix = (f"Je antwoord:\n{shown}\n\nDat klopt niet:\n" + "\n".join(f"- {p}" for p in problems) +
+               "\n\nRoep geef_outfits opnieuw aan met alle outfits, verbeterd. Verander verder niets aan wat goed was.")
+        again = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=[*content, {"type": "text", "text": fix}],
+                                  helpers=helpers))
+        better, left = _outfits(again, by_id, len((previous or {}).get("outfits") or []))
+        if better and len(left) < len(problems):
+            got, outfits = again, better
+    return {"advice": got.get("advies") or "", "outfits": outfits, "missing": got.get("ontbreekt") or ""}
+
+
+def _outfits(got: dict, by_id: dict[str, dict], expected: int = 0) -> tuple[list[dict], list[str]]:
+    """The outfits in the stylist's answer, with only pieces from the list, and what is wrong with them: an id that
+    isn't in the list, no shoes while there are shoes to choose from, fewer outfits than the suggestion it adjusted."""
+    has_shoes = any(i.get("category") == "schoenen" for i in by_id.values())
+    outfits, problems = [], []
     for o in got.get("outfits") or []:
         if not isinstance(o, dict):
             continue
-        ids = list(dict.fromkeys(str(i) for i in o.get("stukken") or [] if str(i) in known))
+        given = [str(i) for i in o.get("stukken") or []]
+        ids = list(dict.fromkeys(i for i in given if i in by_id))
+        title = o.get("titel") or ""
+        if unknown := [i for i in given if i not in by_id]:
+            problems.append(f"Outfit '{title}' heeft id's die niet in de lijst staan: {', '.join(unknown[:5])}. Gebruik de id's precies zoals in de lijst.")
+        if ids and has_shoes and not any(by_id[i].get("category") == "schoenen" for i in ids):
+            problems.append(f"Outfit '{title}' heeft geen schoenen: kies er een paar uit de lijst bij.")
         if ids:
-            outfits.append({"title": o.get("titel") or "", "item_ids": ids, "reason": o.get("waarom") or "",
-                            "tip": o.get("tip") or ""})
-    return {"advice": got.get("advies") or "", "outfits": outfits, "missing": got.get("ontbreekt") or ""}
+            outfits.append({"title": title, "item_ids": ids, "reason": o.get("waarom") or "", "tip": o.get("tip") or ""})
+    if expected and len(outfits) < expected:
+        problems.append(f"Je voorstel had {expected} outfits en je gaf er {len(outfits)} terug: geef ze alle {expected} terug, "
+                        "elk aangepast zoals gevraagd.")
+    return outfits, problems
 
 
 IDENTIFY_SYSTEM = f"""Je helpt iemand de kleren in zijn of haar dressing te registreren. Je krijgt een foto van één kledingstuk (op een hanger, opgevouwen, op de grond of gedragen) en/of een korte omschrijving. Beschrijf het belangrijkste kledingstuk op de foto, zo dat je het later uit een lijst kan herkennen en ermee outfits kan samenstellen.
@@ -566,7 +595,7 @@ INSPIRATION_TOOL = {
 STYLIST_SYSTEM = """Je bent de persoonlijke stylist van iemand en stelt outfits samen uitsluitend met kleren uit zijn of haar eigen dressing. De gebruiker beschrijft een gelegenheid, het weer, een stemming of een stuk dat erin moet. Stel 1 tot 3 outfits voor, de beste eerst, en roep precies één keer de tool geef_outfits aan. Gebruik enkel id's uit de lijst.
 
 Een outfit is compleet en draagbaar:
-- Een bovenstuk en een onderstuk, of een kleed of jumpsuit; schoenen als die in de dressing hangen; een jas of vest als het weer of de gelegenheid dat vraagt; eventueel één of twee accessoires.
+- Een bovenstuk en een onderstuk, of een kleed of jumpsuit; altijd schoenen als die in de lijst staan (ook als je ze in waarom of tip vernoemt: dan horen ze bij stukken); een jas of vest als het weer of de gelegenheid dat vraagt; eventueel één of twee accessoires.
 - Nooit twee stukken die hetzelfde doen (twee broeken, twee paar schoenen).
 
 Kies zoals een stylist dat doet:
@@ -577,7 +606,7 @@ Kies zoals een stylist dat doet:
 - Laat stukken die al lang niet of nog nooit gedragen zijn eens aan bod komen als ze goed passen, en wissel af met wat de laatste dagen al gedragen werd. Favorieten mogen vaker.
 - Wat de gebruiker eerder droeg en hoe het viel (score op 5, notitie), telt mee om te kiezen tussen outfits die al goed passen.
 - Outfits die de gebruiker afwees, stel je niet opnieuw voor (ook niet bijna hetzelfde). Leer van de reden: 'te formeel' bij een vraag voor kantoor betekent dat kantoor minder formeel mag; 'kleuren botsen' of 'combineer ik nooit' gaat over die combinatie van stukken; 'draag ik niet graag' over een van de stukken.
-- Stuurt de gebruiker een vorig voorstel bij ('andere schoenen', 'minder chic'), pas dan dat voorstel aan en verander enkel wat gevraagd wordt; zeg in advies kort wat je veranderde.
+- Stuurt de gebruiker een vorig voorstel bij ('andere schoenen', 'minder chic'), geef dan alle outfits uit dat voorstel terug, in dezelfde volgorde, en verander in elk enkel wat gevraagd wordt; vraagt de gebruiker een heel ander idee, dan mag alles anders. Zeg in advies kort wat je veranderde, en noem daarbij enkel stukken die echt in het voorstel of in je nieuwe outfits staan.
 - Staat er een stijl uit outfits die de gebruiker mooi vindt, kies dan in die geest: dezelfde kleuren, silhouetten en combinaties waar de dressing dat toelaat. Het is smaak, geen filter: het weer en de gelegenheid gaan voor. Vraagt de gebruiker een look na te maken, benader die zo dicht mogelijk met eigen kleren en zeg in ontbreekt welk stuk de look echt zou afmaken.
 
 Harde voorwaarden in de vraag (een kleur, een bepaald stuk, 'geen jeans', 'iets in het rood') zijn een filter, geen voorkeur. Ontbreekt er iets wezenlijks in de dressing voor deze vraag (bv. geen regenjas, geen nette schoenen), zeg dat kort in ontbreekt; dat is een tip om te kopen. Liever één goed outfit dan drie halve.
