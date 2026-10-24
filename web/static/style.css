@@ -340,3 +340,23 @@ dialog.viewer .close { position: absolute; top: calc(var(--safe-top) + 12px); ri
 .auth-rail .bar { fill: none; stroke: var(--foil); stroke-width: 2.5; stroke-linecap: round; vector-effect: non-scaling-stroke; }
 .auth .card { margin-top: 16px; }
 .auth-submit { padding: 12px 16px 16px; border-top: 0.5px solid var(--line); }
+
+/* From an order confirmation: one card per piece found */
+.order-piece { margin-top: 12px; transition: opacity 0.2s; }
+.order-piece.off { opacity: 0.55; }
+.order-piece .row + .field { border-top: 0.5px solid var(--line); }
+.order-check { flex: none; width: 28px; height: 28px; border-radius: 50%; border: 1.5px solid var(--muted); background: none; color: var(--on-accent);
+  font-weight: 700; display: grid; place-items: center; padding: 0; }
+.order-check[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); }
+.order-ph { flex: none; width: 56px; height: 72px; border-radius: 10px; object-fit: cover; background: var(--field); }
+.order-ph.none { display: grid; place-items: center; color: var(--muted); }
+.order-name { width: 100%; border: 0; background: none; outline: none; font-size: 1.0625rem; font-weight: 600; padding: 0; color: var(--text); }
+
+/* The suitcase */
+.trip-strip { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 10px; padding: 10px 14px; border: 0; border-radius: 12px;
+  background: var(--accent-soft); color: var(--text); font-size: 0.875rem; text-align: left; }
+.trip-strip .grow { flex: 1; min-width: 0; }
+.trip-strip > span[aria-hidden] { color: var(--accent); font-weight: 600; white-space: nowrap; }
+.outfit .foot { display: flex; gap: 10px; }
+.outfit .foot > * { flex: 1; }
+label.btn-secondary.disabled { opacity: 0.5; pointer-events: none; }

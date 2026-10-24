@@ -199,3 +199,91 @@ def test_openai_key_is_checked_and_kept_apart(client, monkeypatch):
     assert r.status_code == 200, r.text
     services = client.get("/api/state").json()["ai"]["services"]
     assert services["openai"]["api_key"]["source"] == "app" and services["claude"]["api_key"]["source"] is None
+
+
+def test_order_mail_gives_pieces_with_their_photos(client, monkeypatch):
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low"):
+        seen["tool"], seen["text"] = tool["name"], content[-1]["text"]
+        seen["labels"] = [c["text"] for c in content if c["type"] == "text"][:-1]
+        seen["images"] = sum(c["type"] == "image" for c in content)
+        return {"winkel": "Zara", "besteldatum": "2026-10-20", "stukken": [
+            {"naam": "Ecru gebreide trui", "categorie": "trui", "kleuren": ["ecru"], "maat": "M", "prijs": 39.95, "foto": 2},
+            {"naam": "Zwarte jeans", "categorie": "broek", "kleuren": ["zwart"], "foto": 7},  # no such photo
+        ]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    fetched = []
+    monkeypatch.setattr(main, "_fetch_photo", lambda url: fetched.append(url) or jpeg())
+    mail = "Bedankt voor je bestelling [foto 1]\n[foto 2] ECRU GEBREIDE TRUI maat M 39,95 EUR\nZWARTE JEANS 29,95 EUR"
+    r = client.post("/api/order", json={"text": mail, "photos": ["https://static.zara.net/logo.png", "https://static.zara.net/trui.jpg"]}, headers=H)
+    assert r.status_code == 200, r.text
+    assert seen["tool"] == "registreer_bestelling" and "[foto 2] ECRU" in seen["text"]
+    assert sorted(fetched) == ["https://static.zara.net/logo.png", "https://static.zara.net/trui.jpg"]
+    assert seen["labels"] == ["[foto 1]", "[foto 2]"] and seen["images"] == 2  # the AI sees the pictures
+    trui, jeans = r.json()["pieces"]
+    assert trui["info"] == {"name": "Ecru gebreide trui", "category": "trui", "colors": ["ecru"], "brand": "Zara", "size": "M",
+                            "price": 39.95, "purchase_date": "2026-10-20"}
+    assert trui["thumb"].startswith("data:image/jpeg;base64,") and not jeans["photo_token"]
+    item = client.post("/api/items", json={"data": {**trui["info"], "location": "Kast"}, "photo_token": trui["photo_token"]}, headers=H).json()
+    assert item["photo"] and item["brand"] == "Zara"
+
+
+def test_order_photos_only_from_the_internet():
+    assert not main._public_host("http://static.zara.net/a.jpg")
+    assert not main._public_host("https://127.0.0.1/a.jpg")
+    assert not main._public_host("https://192.168.1.10/a.jpg")
+    assert not main._public_host("https://localhost/a.jpg")
+    assert main._fetch_photo("https://10.0.0.1/a.jpg") is None
+
+
+def test_suitcase_trip_and_stylist(client, monkeypatch):
+    shirt, coat = add(client, name="Linnen hemd"), add(client, name="Winterjas", category="jas")
+
+    async def place(name):
+        return {"name": "Barcelona, Spanje", "lat": 41.4, "lon": 2.2}
+
+    async def trip_forecast(p, start, end):
+        return {"place": p["name"], "start": start, "end": end,
+                "days": [{"date": start, "summary": "helder", "min": 18, "max": 26, "feels_min": 18, "feels_max": 27, "rain": 5, "wind": 12}]}
+    monkeypatch.setattr(weather, "find_place", place)
+    monkeypatch.setattr(weather, "trip_forecast", trip_forecast)
+    assert client.put("/api/trip/items", json={"item_ids": [shirt["id"]]}, headers=H).status_code == 400  # no trip yet
+    assert client.put("/api/trip", json={"destination": "Barcelona", "start": "2026-11-03", "end": "2026-11-01"}, headers=H).status_code == 400
+    trip = client.put("/api/trip", json={"destination": "Barcelona", "start": "2026-11-01", "end": "2026-11-05"}, headers=H).json()["trip"]
+    assert trip["place"]["name"] == "Barcelona, Spanje" and trip["item_ids"] == []
+    seen = []
+
+    async def fake_ask(user, tool, *, system, content, effort="low"):
+        seen.append("\n".join(c["text"] for c in content))
+        return {"advies": "", "outfits": [{"titel": "Look", "stukken": [shirt["id"], coat["id"]], "waarom": "."}]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    # An empty suitcase: the stylist helps to pack, from the whole dressing.
+    r = client.post("/api/stylist", json={"query": "inpakken", "trip": True}, headers=H).json()
+    assert "Winterjas" in seen[-1] and "nog inpakken" in seen[-1] and "18 tot 26 °C" in seen[-1]
+    packed = client.put("/api/trip/items", json={"item_ids": [shirt["id"], "VAN-IEMAND-ANDERS"]}, headers=H).json()["trip"]
+    assert packed["item_ids"] == [shirt["id"]]
+    r = client.post("/api/stylist", json={"query": "stad", "trip": True}, headers=H).json()
+    assert "Mijn valies" in seen[-1] and "Winterjas" not in seen[-1]
+    assert r["outfits"][0]["item_ids"] == [shirt["id"]]
+    # Changing the dates keeps what is packed; ending the trip empties it.
+    again = client.put("/api/trip", json={"destination": "Barcelona", "start": "2026-11-02", "end": "2026-11-05"}, headers=H).json()["trip"]
+    assert again["item_ids"] == [shirt["id"]]
+    assert client.get("/api/state").json()["trip"]["start"] == "2026-11-02"
+    client.delete("/api/trip", headers=H)
+    assert client.get("/api/state").json()["trip"] is None
+
+
+def test_trip_weather_text():
+    w = {"place": "Oslo, Noorwegen", "start": "2027-01-10", "end": "2027-01-12", "days": []}
+    assert "gebruikelijke weer in Oslo" in weather.describe_trip(w)
+
+
+def test_order_from_a_pdf_takes_its_pictures(client):
+    out = io.BytesIO()
+    Image.new("RGB", (54, 76), "beige").save(out, "PDF")
+    text, photos = main._pdf_contents(out.getvalue())
+    assert list(photos) == [1] and Image.open(io.BytesIO(photos[1])).size == (54, 76)
+    r = client.post("/api/order/pdf", files={"pdf": ("b.pdf", out.getvalue(), "application/pdf")}, headers=H)
+    assert r.status_code == 400 and "geen leesbare tekst" in r.json()["detail"]  # a picture only: nothing to read
+    assert client.post("/api/order/pdf", files={"pdf": ("b.pdf", b"geen pdf", "application/pdf")}, headers=H).status_code == 400

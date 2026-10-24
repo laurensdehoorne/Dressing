@@ -21,12 +21,16 @@ const SUGGESTIONS = [
     ["🎩", "Klassiek en verzorgd"], ["🎨", "Kleurrijk"], ["🖤", "Volledig in donkere tinten"]]],
 ];
 
+const TRIP_SUGGESTIONS = [["Op reis", [["🧳", "Wat neem ik mee? Help me inpakken"], ["🗺️", "Een dag op stap in de stad"], ["🍽️", "Etentje 's avonds"],
+  ["🥾", "Een wandeldag"], ["🏖️", "Een dag aan het water"], ["✈️", "De reisdag zelf"]]]];
+
 let S = { items: [], worn: [], categories: [], statuses: [] };
 const ui = {
   tab: "dressing",
   category: "", search: "", sort: "added", place: "",
-  stylist: { query: "", loading: false, result: null, error: null, useWeather: true, step: "" },
+  stylist: { query: "", loading: false, result: null, error: null, useWeather: true, step: "", onTrip: null },
   auth: null,
+  tripWeather: undefined,
   weather: undefined,
 };
 let stack = []; // pushed pages: {kind: "detail"|"add"|"edit"|"outfit", ...}
@@ -108,7 +112,8 @@ function signedOut() {
   S = { items: [], worn: [], categories: [], statuses: [] };
   stack = [];
   ui.users = null; ui.models = null; ui.weather = undefined;
-  ui.stylist = { query: "", loading: false, result: null, error: null, useWeather: true, step: "" };
+  ui.stylist = { query: "", loading: false, result: null, error: null, useWeather: true, step: "", onTrip: null };
+  ui.tripWeather = undefined;
   if ($("#sheet").open) closeSheet();
   render();
 }
@@ -181,9 +186,9 @@ function filteredItems() {
   return list.sort(sorts[ui.sort] || sorts.added);
 }
 
-function itemTile(i, { selectable = false, selected = false } = {}) {
+function itemTile(i, { selectable = false, selected = false, act = "toggle-piece" } = {}) {
   const sub = [i.kind || catLabel(i.category), i.location].filter(Boolean).join(" · ");
-  return `<button class="tile-item${away(i) ? " away" : ""}" data-act="${selectable ? "toggle-piece" : "open"}" data-id="${h(i.id)}"
+  return `<button class="tile-item${away(i) ? " away" : ""}" data-act="${selectable ? act : "open"}" data-id="${h(i.id)}"
       ${selectable ? `aria-pressed="${selected}"` : ""}>
       ${i.photo ? `<img class="ph" src="${h(small(i.photo))}" alt="" loading="lazy">` : `<span class="ph none">${ic("shirt")}</span>`}
       ${away(i) ? `<span class="flag">${h(statusLabel(i.status))}</span>` : ""}
@@ -242,6 +247,7 @@ function renderDetail(page) {
       <button class="btn-primary" data-act="wear-one" data-id="${h(i.id)}">Vandaag gedragen</button>
       <button class="btn-secondary" data-act="status-sheet" data-id="${h(i.id)}">Waar is het?</button></div>
     <button class="btn-secondary" style="margin-top:10px" data-act="style-with" data-id="${h(i.id)}">${ic("sparkle")} Outfit rond dit stuk</button>
+    ${S.trip ? `<button class="btn-secondary" style="margin-top:10px" data-act="pack-one" data-id="${h(i.id)}">🧳 ${packed(i.id) ? "Uit de valies halen" : `In de valies voor ${h(tripName())}`}</button>` : ""}
     ${i.description ? `<p style="margin:18px 4px 0;line-height:1.45">${h(i.description)}</p>` : ""}
     <h2 class="section-title">Kenmerken</h2>
     <div class="card">
@@ -289,7 +295,119 @@ function renderAdd(page) {
     ${page.error ? `<div class="notice err">${h(page.error)}</div>` : ""}
     <div class="buttons">
       ${page.hint ? `<button class="btn-secondary" data-act="identify-text" ${aiReady() ? "" : "disabled"}>Herkennen zonder foto</button>` : ""}
+      <button class="btn-secondary" data-act="order">🛍️ Uit een bestelmail (Zara, H&amp;M…)</button>
       <button class="btn-secondary" data-act="manual">Zelf invullen</button></div>`;
+}
+
+// MARK: - From an order confirmation
+
+/** Pasted mail (HTML) as text, with [foto N] where a picture stood: the server fetches the pictures and the AI matches
+    them to the pieces (and reads a colour from a swatch). Tracking pixels and pictures that aren't on the web stay out. */
+function mailText(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const photos = [], out = [];
+  const BLOCK = /^(P|DIV|TR|TABLE|LI|UL|OL|H[1-6]|BR|SECTION|ARTICLE|HEADER|FOOTER|CENTER|BLOCKQUOTE)$/;
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) { out.push(node.textContent); return; }
+    if (node.nodeType !== Node.ELEMENT_NODE || /^(STYLE|SCRIPT|HEAD|TITLE)$/.test(node.tagName)) return;
+    if (node.tagName === "IMG") {
+      const src = node.getAttribute("src") || "", w = Number(node.getAttribute("width")), hgt = Number(node.getAttribute("height"));
+      if (!src.startsWith("https://") || (w && w < 12) || (hgt && hgt < 12)) return;
+      let n = photos.indexOf(src) + 1;
+      if (!n) n = photos.push(src);
+      out.push(` [foto ${n}] `);
+      return;
+    }
+    if (BLOCK.test(node.tagName)) out.push("\n");
+    node.childNodes.forEach(walk);
+    if (BLOCK.test(node.tagName)) out.push("\n");
+    if (node.tagName === "TD") out.push(" ");
+  };
+  walk(doc.body);
+  const text = out.join("").replace(/[ \t\u00a0]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return { text, photos };
+}
+
+const alreadyHave = (info) => S.items.some((i) => fold(i.name) === fold(info.name) && fold(i.size) === fold(info.size));
+
+function renderOrder(page) {
+  const bar = `<div class="topbar"><button class="btn-plain" data-act="back">Annuleer</button><span class="title">Uit een bestelmail</span><span class="spacer"></span></div>`;
+  if (page.phase === "reading") return `${bar}<div class="analyzing"><div class="spinner"></div><p><b>${h(page.step || "De AI leest je bestelling…")}</b></p>
+      <p class="muted small">Welke kleren, kleur, maat en prijs, en de foto bij elk stuk.</p></div>`;
+  if (page.phase === "pick") {
+    const chosen = page.pieces.filter((p) => p.on).length;
+    return `${bar}
+      <p class="subtitle">${h([page.shop, page.date && shortDate(page.date)].filter(Boolean).join(" · ")) || "Gevonden in de mail"}: ${plural(page.pieces.length, "stuk", "stukken")}.
+        Vink aan wat je houdt en zeg waar het hangt.</p>
+      <div class="card"><div class="field"><label for="o-all">Waar hangen ze? (voor alle stukken)</label>
+        <input id="o-all" data-order-all list="locations" value="${h(page.all)}" placeholder="bv. Linkerkast, plank 2"></div></div>
+      ${locationList()}
+      ${page.pieces.map((p, n) => `<div class="card order-piece${p.on ? "" : " off"}">
+        <div class="row"><button type="button" class="order-check" data-act="toggle-order" data-n="${n}" aria-pressed="${p.on}" aria-label="Toevoegen">${p.on ? "✓" : ""}</button>
+          ${p.thumb ? `<img class="order-ph" src="${p.thumb}" alt="">` : `<span class="order-ph none">${ic("shirt")}</span>`}
+          <span class="grow" style="min-width:0"><input class="order-name" data-piece="${n}" data-field="name" value="${h(p.draft.name)}" aria-label="Naam">
+            <span class="muted small" style="display:block">${swatches(p.draft)}${h([p.draft.brand, p.draft.size && `maat ${p.draft.size}`,
+              p.draft.price != null && `€ ${String(p.draft.price).replace(".", ",")}`].filter(Boolean).join(" · "))}</span>
+            ${p.dup ? `<span class="small" style="color:var(--orange);display:block">Lijkt al in je dressing te hangen</span>` : ""}</span></div>
+        <div class="field split"><div><label for="o-cat-${n}">Soort</label><select id="o-cat-${n}" data-piece="${n}" data-field="category">
+            ${S.categories.map((c) => `<option value="${c.key}" ${p.draft.category === c.key ? "selected" : ""}>${h(c.label)}</option>`).join("")}</select></div>
+          <div><label for="o-loc-${n}">Plaats</label><input id="o-loc-${n}" data-piece="${n}" data-field="location" list="locations" value="${h(p.draft.location)}"></div></div>
+      </div>`).join("")}
+      ${page.error ? `<div class="notice err">${h(page.error)}</div>` : ""}
+      <div class="buttons"><button class="btn-primary" data-act="save-order" ${chosen && !page.saving ? "" : "disabled"}>
+        ${page.saving ? `<span class="spinner sm"></span>` : ""}${chosen ? `${plural(chosen, "stuk", "stukken")} toevoegen` : "Niets aangevinkt"}</button></div>
+      <p class="footnote">Details zoals seizoen, warmte en stijl vulde de AI al in; je past ze later aan met Bewerk.</p>`;
+  }
+  return `${bar}
+    ${!aiReady() ? `<div class="notice">Zonder API-sleutel kan de AI de mail niet lezen. Stel er een in bij Instellingen.</div>` : ""}
+    <p class="subtitle">Open de bevestiging of verzendmail van je bestelling, selecteer alles (of kopieer de hele mail) en plak het hieronder.
+      De AI haalt er elk kledingstuk uit, met de foto uit de mail.</p>
+    <div class="card"><div class="field"><label for="o-mail">De bestelmail</label>
+      <textarea id="o-mail" data-paste="order" rows="8" placeholder="Plak hier de mail van Zara, H&amp;M, Zalando…">${h(page.text)}</textarea></div></div>
+    ${page.photos?.length ? `<p class="footnote">${plural(page.photos.length, "afbeelding", "afbeeldingen")} gevonden in de mail.</p>` : ""}
+    ${page.error ? `<div class="notice err">${h(page.error)}</div>` : ""}
+    <div class="buttons"><button class="btn-primary" data-act="read-order" ${aiReady() ? "" : "disabled"}>Lees de bestelling</button>
+      <label class="btn-secondary${aiReady() ? "" : " disabled"}">📄 Of kies de mail als PDF<input class="file-input" type="file" accept="application/pdf,.pdf" data-act-change="order-pdf" ${aiReady() ? "" : "disabled"}></label></div>
+    <p class="footnote">Een PDF maak je met Afdrukken → Bewaar als PDF. De foto's uit een geplakte mail zijn wel scherper.</p>`;
+}
+
+async function readOrder(page, pdf = null) {
+  if (!pdf && (page.text || "").trim().length < 20) { page.error = "Plak eerst de volledige bestelmail."; return render(); }
+  Object.assign(page, { phase: "reading", error: null, step: "" });
+  render();
+  let path = "/api/order", opts = { method: "POST", json: { text: page.text, photos: page.photos || [] } };
+  if (pdf) { const form = new FormData(); form.append("pdf", pdf, "bestelling.pdf"); path = "/api/order/pdf"; opts = { method: "POST", form }; }
+  try {
+    const r = await slowApi(path, opts,
+      (p) => { if (p.step && p.step !== page.step) { page.step = p.step; if (stack.at(-1) === page) render(); } });
+    if (!r.pieces.length) throw new Error("Geen kleren gevonden in deze mail. Plak je de bevestiging met de bestelde stukken?");
+    page.all = ui.lastLocation || "";
+    page.pieces = r.pieces.map((p) => ({ draft: { ...newDraft(), ...p.info, location: page.all }, token: p.photo_token, thumb: p.thumb,
+      dup: alreadyHave(p.info), on: !alreadyHave(p.info) }));
+    Object.assign(page, { phase: "pick", shop: r.shop, date: r.date });
+  } catch (e) { Object.assign(page, { phase: "paste", error: e.message }); }
+  if (stack.includes(page)) render();
+}
+
+async function saveOrder(page) {
+  if (page.saving) return;
+  page.saving = true; page.error = null; render();
+  let added = 0;
+  try {
+    for (const p of page.pieces) {
+      if (!p.on || p.saved) continue;
+      await api("/api/items", { method: "POST", json: { data: draftOut(p.draft), photo_token: p.token || "" } });
+      p.saved = true; p.on = false; added++;
+    }
+  } catch (e) { page.error = `${e.message}${added ? ` (${plural(added, "stuk", "stukken")} wel toegevoegd)` : ""}`; }
+  const last = page.pieces.find((p) => p.saved && p.draft.location)?.draft.location;
+  if (last) ui.lastLocation = last;
+  page.saving = false;
+  await load();
+  if (page.error) return render();
+  stack = []; ui.tab = "dressing"; ui.category = ""; ui.search = ""; ui.sort = "added";
+  render(); scrollTo(0, 0);
+  toast(`${plural(added, "stuk", "stukken")} toegevoegd aan je dressing`);
 }
 
 function renderEdit(page) {
@@ -359,7 +477,85 @@ function draftOut(d) {
 
 // MARK: - Stylist tab
 
+// MARK: - The suitcase
+
+const tripName = () => S.trip?.place?.name.split(",")[0] || "";
+const packed = (id) => !!S.trip?.item_ids.includes(id);
+const packedItems = () => (S.trip?.item_ids || []).map(itemById).filter(Boolean);
+/** On the trip: the stylist chooses from the suitcase with the destination's weather. On by default from the day before leaving. */
+function onTrip() {
+  if (!S.trip) return false;
+  if (ui.stylist.onTrip !== null) return ui.stylist.onTrip;
+  const d = new Date(`${today()}T12:00:00`); d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10) >= S.trip.start && today() <= S.trip.end;
+}
+const tripDates = (t) => `${shortDate(t.start).replace(/ \d{4}$/, "")} – ${shortDate(t.end)}`;
+
+async function loadTripWeather() {
+  if (!S.trip) return;
+  ui.tripWeather = null;
+  try { ui.tripWeather = await api("/api/trip/weather"); } catch { ui.tripWeather = false; }
+  render();
+}
+
+function tripWeatherHTML() {
+  const w = ui.tripWeather;
+  if (w === undefined) { loadTripWeather(); return ""; }
+  if (w === null) return `<p class="footnote">Weer ophalen…</p>`;
+  if (w === false) return `<p class="footnote">Het weer op je bestemming is niet beschikbaar.</p>`;
+  if (!w.days.length) return `<p class="footnote">Nog te ver vooruit voor een weersvoorspelling (tot 16 dagen). De stylist gaat uit van het gebruikelijke weer daar in die periode.</p>`;
+  return `<div class="card">${w.days.map((d) => `<div class="row"><span class="grow">${h(longDate(d.date))}<span class="muted small" style="display:block">${h(d.summary)}, ${d.rain}% kans op neerslag</span></span>
+    <span class="v"><b>${d.min}–${d.max}°</b></span></div>`).join("")}</div>
+    ${w.days.at(-1).date < w.end ? `<p class="footnote">Voor de dagen daarna is er nog geen voorspelling.</p>` : ""}`;
+}
+
+function tripStrip() {
+  if (!S.trip) return `<button class="trip-strip" data-act="trip">🧳 <span class="grow">Op reis? Vul je valies, dan kiest de stylist daaruit met het weer ter plaatse.</span><span aria-hidden="true">›</span></button>`;
+  const n = packedItems().length;
+  return `<div class="pills" role="group" aria-label="Waar ben je?" style="margin-top:10px">
+      <button data-act="trip-mode" data-value="0" aria-pressed="${!onTrip()}">🏠 Thuis</button>
+      <button data-act="trip-mode" data-value="1" aria-pressed="${onTrip()}">🧳 ${h(tripName())}<span class="n">${h(tripDates(S.trip))}</span></button></div>
+    ${onTrip() ? `<button class="trip-strip" data-act="trip"><span class="grow">${n ? `${plural(n, "stuk", "stukken")} in je valies: de stylist kiest enkel daaruit.` : "Je valies is nog leeg: de stylist helpt je inpakken uit je dressing."}</span><span aria-hidden="true">Valies ›</span></button>` : ""}`;
+}
+
+function renderTrip(page) {
+  const t = S.trip, d = page.draft;
+  const form = `<form class="card" data-act-submit="save-trip">
+      <div class="field"><label for="t-dest">Bestemming</label><input id="t-dest" name="destination" value="${h(d.destination)}" placeholder="bv. Barcelona" required></div>
+      <div class="field split"><div><label for="t-start">Vertrek</label><input id="t-start" name="start" type="date" value="${h(d.start)}" required></div>
+        <div><label for="t-end">Terug</label><input id="t-end" name="end" type="date" value="${h(d.end)}" required></div></div>
+      <div class="auth-submit"><button class="btn-primary" ${page.saving ? "disabled" : ""}>${page.saving ? `<span class="spinner sm"></span>` : ""}${t ? "Reis aanpassen" : "Valies klaarzetten"}</button></div></form>`;
+  const bar = `<div class="topbar"><button class="btn-plain" data-act="back">‹ Terug</button><span class="title">Valies</span><span class="spacer"></span></div>`;
+  if (!t) return `${bar}<p class="subtitle">Waar ga je naartoe en wanneer? Daarna leg je kleren in je valies, en kiest de stylist op reis enkel daaruit, met het weer ter plaatse.</p>${form}`;
+  const chosen = new Set(t.item_ids);
+  const pool = S.items.filter((i) => page.filter === "packed" ? chosen.has(i.id) : !page.filter || i.category === page.filter);
+  return `${bar}<h1 class="large">🧳 ${h(tripName())}</h1><p class="subtitle">${h(tripDates(t))}</p>
+    ${tripWeatherHTML()}
+    <h2 class="section-title">${chosen.size ? `${plural(chosen.size, "stuk", "stukken")} in je valies` : "Tik aan wat je meeneemt"}</h2>
+    <div class="pills" role="group" aria-label="Tonen"><button data-act="trip-filter" data-value="packed" aria-pressed="${page.filter === "packed"}">🧳 In de valies<span class="n">${chosen.size}</span></button></div>
+    ${categoryPills(S.items, page.filter === "packed" ? null : page.filter || "", "trip-filter")}
+    ${pool.length ? `<div class="grid">${pool.map((i) => itemTile(i, { selectable: true, selected: chosen.has(i.id), act: "toggle-pack" })).join("")}</div>`
+      : `<div class="empty"><p>Nog niets in je valies.</p></div>`}
+    <button class="btn-secondary" style="margin-top:16px" data-act="pack-help">${ic("sparkle")} Laat de stylist helpen inpakken</button>
+    <h2 class="section-title">Reis</h2>${form}
+    <div class="card" style="margin-top:20px"><div class="row"><button class="row-button danger" data-act="end-trip">Terug thuis: valies leegmaken</button></div></div>`;
+}
+
+async function savePacked(ids) {
+  S.trip.item_ids = ids; render(); // at once; the server follows
+  try { S.trip = (await api("/api/trip/items", { method: "PUT", json: { item_ids: ids } })).trip; }
+  catch (e) { toast(e.message); await load(); }
+  render();
+}
+
 function weatherLine() {
+  if (onTrip()) {
+    const w = ui.tripWeather, d = w?.days?.[0];
+    if (w === undefined) loadTripWeather();
+    const text = w === null || w === undefined ? "Weer ophalen…" : w === false ? "Weer niet beschikbaar" :
+      d ? `<b>${d.min}–${d.max}°</b> ${h(d.summary)} in ${h(tripName())} (${h(longDate(d.date))})` : `Nog geen voorspelling voor ${h(tripName())}`;
+    return `<div class="weather-strip"><span>🌦️ ${text}</span></div>`;
+  }
   if (!S.place) return `<div class="weather-strip">🌍 <span>Stel je woonplaats in bij Instellingen, dan houdt de stylist rekening met het weer.</span></div>`;
   const w = ui.weather;
   const now = w?.current, d = w?.days?.[0];
@@ -374,17 +570,18 @@ function renderStylist() {
   const top = `<h1 class="large">Wat aantrekken?</h1>
     <form class="ask" data-act-submit="ask"><textarea name="query" rows="1" placeholder="Gelegenheid, weer, stemming… bv. 'etentje bij schoonouders, het regent'" aria-label="Je vraag" data-bind-stylist="query">${h(st.query)}</textarea>
       <button class="btn-pill icon primary" aria-label="Vraag een outfit" ${st.loading ? "disabled" : ""}>${st.loading ? `<span class="spinner sm"></span>` : "↑"}</button></form>
-    ${weatherLine()}`;
+    ${tripStrip()}${weatherLine()}`;
   if (!S.items.length) return `${top}<div class="empty"><p>Voeg eerst kleren toe aan je dressing; de stylist kiest enkel uit wat je hebt.</p></div>`;
   if (!aiReady()) return `${top}<div class="notice">Stel een API-sleutel voor ${h(aiService().name)} in bij Instellingen om outfits te laten voorstellen.</div>`;
-  if (st.loading) return `${top}<div class="analyzing"><div class="spinner"></div><p><b>${h(st.step || "Je stylist denkt na…")}</b></p><p class="muted small">Kijkt naar je dressing${st.useWeather && S.place ? ", het weer" : ""} en wat je laatst droeg.</p></div>`;
+  if (st.loading) return `${top}<div class="analyzing"><div class="spinner"></div><p><b>${h(st.step || "Je stylist denkt na…")}</b></p><p class="muted small">${onTrip()
+    ? `Kijkt naar ${packedItems().length ? "je valies" : "je dressing"} en het weer in ${h(tripName())}.` : `Kijkt naar je dressing${st.useWeather && S.place ? ", het weer" : ""} en wat je laatst droeg.`}</p></div>`;
   if (st.error) return `${top}<div class="notice err">${h(st.error)}</div>${suggestions()}`;
   if (st.result) return `${top}${outfitsHTML(st.result)}<div class="buttons"><button class="btn-secondary" data-act="stylist-reset">Nieuwe vraag</button></div>`;
   return `${top}${suggestions()}`;
 }
 
 function suggestions() {
-  return SUGGESTIONS.map(([title, list]) => `<div class="sugg-group"><h3>${h(title)}</h3><div class="sugg">
+  return (onTrip() ? TRIP_SUGGESTIONS : SUGGESTIONS).map(([title, list]) => `<div class="sugg-group"><h3>${h(title)}</h3><div class="sugg">
     ${list.map(([emoji, text]) => `<button data-act="suggest" data-q="${h(text)}">${emoji} ${h(text)}</button>`).join("")}</div></div>`).join("");
 }
 
@@ -400,7 +597,8 @@ function outfitsHTML(r) {
       <div class="head"><span class="n">Outfit ${n + 1}</span><h2>${h(o.title)}</h2></div>
       <div class="pieces">${o.item_ids.map(piece).join("")}</div>
       <p class="why">${h(o.reason)}</p>${o.tip ? `<p class="tip">💡 ${h(o.tip)}</p>` : ""}
-      <div class="foot"><button class="btn-primary" data-act="wear-outfit" data-n="${n}">Dit draag ik</button></div></article>`).join("")}
+      <div class="foot">${r.trip && o.item_ids.some((id) => !packed(id)) ? `<button class="btn-secondary" data-act="pack-outfit" data-n="${n}">🧳 In de valies</button>` : ""}
+        <button class="btn-primary" data-act="wear-outfit" data-n="${n}">Dit draag ik</button></div></article>`).join("")}
     ${!r.outfits.length ? `<div class="notice">Geen outfit gevonden die past.</div>` : ""}
     ${r.missing ? `<div class="notice">🛍️ ${h(r.missing)}</div>` : ""}`;
 }
@@ -411,9 +609,11 @@ async function askStylist(query) {
   Object.assign(st, { query, loading: true, error: null, result: null, step: "" });
   render();
   try {
-    st.result = await slowApi("/api/stylist", { method: "POST", json: { query, use_weather: st.useWeather } },
+    const trip = onTrip();
+    st.result = await slowApi("/api/stylist", { method: "POST", json: { query, use_weather: st.useWeather, trip } },
       (p) => { if (p.step && p.step !== st.step) { st.step = p.step; if (ui.tab === "stylist" && !stack.length) render(); } });
     if (st.result.weather) ui.weather = st.result.weather;
+    st.result.trip = trip;
   } catch (e) { st.error = e.message; }
   st.loading = false;
   render();
@@ -602,7 +802,7 @@ function render() {
   if (!page) { pages.innerHTML = ""; document.body.style.overflow = ""; return; }
   const same = pages.firstElementChild?.dataset.key === String(page.key);
   const scroll = same ? pages.firstElementChild.scrollTop : 0;
-  const views = { detail: renderDetail, add: renderAdd, edit: renderEdit, outfit: renderOutfit };
+  const views = { detail: renderDetail, add: renderAdd, edit: renderEdit, outfit: renderOutfit, order: renderOrder, trip: renderTrip };
   pages.innerHTML = `<div class="page${same ? "" : " enter"}" data-key="${page.key}"><div class="inner">${views[page.kind](page)}</div></div>`;
   pages.firstElementChild.scrollTop = scroll;
   pages.firstElementChild.addEventListener("scroll", (e) => updateBars(e.currentTarget), { passive: true });
@@ -612,7 +812,7 @@ function render() {
 
 function pageTitle(page) {
   if (page.kind === "detail") return itemById(page.id)?.name || "Kledingstuk";
-  return { add: "Toevoegen", edit: "Bewerken", outfit: "Gedragen" }[page.kind];
+  return { add: "Toevoegen", edit: "Bewerken", outfit: "Gedragen", order: "Uit een bestelmail", trip: "Valies" }[page.kind];
 }
 
 let pageSeq = 0;
@@ -650,6 +850,10 @@ const actions = {
   "close-sheet": () => closeSheet(),
   "view-photo": (el) => viewPhoto(el.dataset.src),
   "close-viewer": () => $("#viewer").close(),
+  order: () => { stack[stack.length - 1] = { key: ++pageSeq, kind: "order", phase: "paste", text: "", photos: [] }; render(); },
+  "read-order": () => readOrder(stack.at(-1)),
+  "toggle-order": (el) => { const p = stack.at(-1).pieces[Number(el.dataset.n)]; p.on = !p.on; render(); },
+  "save-order": () => saveOrder(stack.at(-1)),
   manual: () => { const p = stack.at(-1); Object.assign(p, { phase: "review", draft: newDraft(), error: null }); render(); },
   async "identify-text"() { await identify(stack.at(-1), null); },
   edit: (el) => { const i = itemById(el.dataset.id); push({ kind: "edit", id: i.id, draft: structuredClone(i) }); },
@@ -704,6 +908,20 @@ const actions = {
     if (await mutate(() => api(`/api/worn/${page.logId}`, { method: "DELETE" }))) { stack = []; render(); }
   },
   suggest: (el) => askStylist(el.dataset.q),
+  trip: () => {
+    const t = S.trip;
+    push({ kind: "trip", filter: t?.item_ids.length ? "packed" : "", draft: { destination: t?.place.query || "", start: t?.start || today(), end: t?.end || today() } });
+  },
+  "trip-mode": (el) => { ui.stylist.onTrip = el.dataset.value === "1"; Object.assign(ui.stylist, { result: null, error: null }); render(); },
+  "trip-filter": (el) => { const p = stack.at(-1); p.filter = el.dataset.value === "packed" && p.filter === "packed" ? "" : el.dataset.value; render(); },
+  "toggle-pack": (el) => { const ids = S.trip.item_ids, id = el.dataset.id; savePacked(ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]); },
+  "pack-one": (el) => { const ids = S.trip.item_ids, id = el.dataset.id; savePacked(ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]).then(() => toast(packed(id) ? "In de valies" : "Uit de valies")); },
+  "pack-outfit": (el) => { const o = ui.stylist.result.outfits[Number(el.dataset.n)]; savePacked([...new Set([...S.trip.item_ids, ...o.item_ids])]).then(() => toast("In de valies")); },
+  "pack-help": () => { stack = []; ui.tab = "stylist"; ui.stylist.onTrip = true; askStylist(`Wat neem ik mee naar ${tripName()}? Help me inpakken.`); },
+  async "end-trip"() {
+    if (!confirm(`Je reis naar ${tripName()} afsluiten en de valies leegmaken? De kleren blijven gewoon in je dressing.`)) return;
+    if (await mutate(() => api("/api/trip", { method: "DELETE" }))) { ui.stylist.onTrip = null; ui.tripWeather = undefined; stack = []; render(); toast("Welkom thuis"); }
+  },
   "stylist-reset": () => { Object.assign(ui.stylist, { query: "", result: null, error: null }); render(); },
   async logout() { await api("/api/auth/logout", { method: "POST" }).catch(() => {}); signedOut(); },
   "password-sheet": () => passwordSheet({ title: "Wachtwoord wijzigen", submit: "change-password", current: true }),
@@ -763,6 +981,15 @@ const submits = {
     await authSubmit("/api/auth/setup", form);
   },
   ask(form) { askStylist(form.query.value); },
+  async "save-trip"(form) {
+    const page = stack.at(-1);
+    Object.assign(page.draft, { destination: form.destination.value, start: form.start.value, end: form.end.value });
+    page.saving = true; render();
+    const r = await mutate(() => api("/api/trip", { method: "PUT", json: page.draft }));
+    page.saving = false;
+    if (r) { ui.tripWeather = undefined; ui.stylist.onTrip = null; page.filter = ""; toast(`Valies voor ${tripName()}`); }
+    render();
+  },
   async "save-new"() { await saveItem(stack.at(-1), true); },
   async "save-edit"() { await saveItem(stack.at(-1), false); },
   async "set-location"(form) {
@@ -830,6 +1057,7 @@ const changes = {
     const form = new FormData(); form.append("photo", await smaller(file), "foto.jpg");
     if (await mutate(() => api(`/api/items/${page.id}/photo`, { method: "POST", form }))) { page.preview = null; render(); toast("Foto vervangen"); }
   },
+  "order-pdf": (el) => { const file = el.files?.[0]; if (file) readOrder(stack.at(-1), file); },
   "use-weather": (el) => { ui.stylist.useWeather = el.checked; },
 };
 
@@ -849,9 +1077,28 @@ document.addEventListener("change", (e) => { const el = e.target.closest("[data-
 document.addEventListener("input", (e) => {
   const el = e.target;
   if (el.dataset.bind) { const d = stack.at(-1)?.draft; if (d) d[el.dataset.bind] = el.type === "checkbox" ? el.checked : el.value; }
+  if (el.dataset.piece) stack.at(-1).pieces[Number(el.dataset.piece)].draft[el.dataset.field] = el.value;
+  if (el.dataset.paste === "order") { const p = stack.at(-1); p.text = el.value; if (!el.value.trim()) p.photos = []; }
+  if (el.dataset.orderAll !== undefined) { // one place for every piece, except one given its own place
+    const page = stack.at(-1), old = page.all;
+    page.all = el.value;
+    page.pieces.forEach((p, n) => { if (p.draft.location === old) { p.draft.location = el.value; const input = document.getElementById(`o-loc-${n}`); if (input) input.value = el.value; } });
+  }
   if (el.dataset.bindPage) { const p = stack.at(-1); p[el.dataset.bindPage] = el.value; if (el.dataset.bindPage === "hint") { const had = !!e.target.closest(".page").querySelector('[data-act="identify-text"]'); if (had !== !!el.value) render(); } }
   if (el.dataset.bindUi) { ui[el.dataset.bindUi] = el.value; render(); }
   if (el.dataset.bindStylist) ui.stylist[el.dataset.bindStylist] = el.value;
+});
+// A mail pasted with its layout: keep where the pictures stood, as [foto N].
+document.addEventListener("paste", (e) => {
+  if (e.target.dataset?.paste !== "order") return;
+  const html = e.clipboardData?.getData("text/html");
+  if (!html) return;
+  const { text, photos } = mailText(html);
+  if (!text) return;
+  e.preventDefault();
+  const page = stack.at(-1);
+  Object.assign(page, { text, photos, error: null });
+  render();
 });
 // Enter sends the question; Shift+Enter makes a new line.
 document.addEventListener("keydown", (e) => {

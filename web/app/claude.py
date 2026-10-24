@@ -181,6 +181,48 @@ async def identify_item(user: dict, photo_jpeg: bytes | None, hint: str | None) 
     return {k: v for k, v in info.items() if v not in (None, "", [])}
 
 
+# MARK: - Reading an order confirmation
+
+def _order_piece(got: dict, shop: str, day: str) -> dict:
+    info = db.clean_item({
+        "name": got.get("naam"), "category": got.get("categorie"), "kind": got.get("soort"), "colors": got.get("kleuren"),
+        "pattern": got.get("patroon"), "material": got.get("materiaal"), "brand": got.get("merk") or shop,
+        "size": got.get("maat"), "fit": got.get("pasvorm"), "seasons": got.get("seizoenen"), "warmth": got.get("warmte"),
+        "formality": got.get("formaliteit"), "occasions": got.get("gelegenheden"), "style_tags": got.get("stijl"),
+        "description": got.get("beschrijving"), "price": got.get("prijs"), "purchase_date": day,
+    })
+    return {k: v for k, v in info.items() if v not in (None, "", [])}
+
+
+async def read_order(user: dict, text: str, photos: dict[int, bytes]) -> dict:
+    """The pieces of clothing in an order confirmation (Zara, H&M, Mango, ...), each with the number of its photo when it
+    has one. The AI sees the pictures (small JPEGs by number): to match them to the pieces, and for the colour when the
+    mail only shows a swatch."""
+    content: list = []
+    for n, jpeg in photos.items():
+        content.append({"type": "text", "text": f"[foto {n}]"})
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(jpeg).decode()}})
+    content.append({"type": "text", "text": f"Vandaag is het {date.today().isoformat()}.\n\nDe bestelmail:\n{text}"})
+    report(step="Bestelling lezen")
+    got = await _timed(_ask(user, ORDER_TOOL, system=ORDER_SYSTEM, content=content))
+    shop = str(got.get("winkel") or "").strip()[:80]
+    day = str(got.get("besteldatum") or "").strip()[:10]
+    try:
+        date.fromisoformat(day)
+    except ValueError:
+        day = ""
+    pieces = []
+    for p in got.get("stukken") or []:
+        if not isinstance(p, dict) or not p.get("naam"):
+            continue
+        try:
+            photo = int(p.get("foto") or 0)
+        except (TypeError, ValueError):
+            photo = 0
+        pieces.append({"info": _order_piece(p, shop, day), "photo": photo if photo in photos else 0})
+    return {"shop": shop, "date": day, "pieces": pieces}
+
+
 # MARK: - The stylist
 
 def _item_line(item: dict, wear: dict) -> str:
@@ -210,17 +252,23 @@ def _item_line(item: dict, wear: dict) -> str:
 
 
 async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[dict], *, weather: str = "",
-                          profile: str = "") -> dict:
-    """1 to 3 outfits from the pieces in the dressing for this question (an occasion, the weather, a mood)."""
+                          profile: str = "", packed: list[str] | None = None) -> dict:
+    """1 to 3 outfits from the pieces in the dressing for this question (an occasion, the weather, a mood); on a trip
+    (packed: what is in the suitcase) only from the suitcase."""
     wear: dict[str, dict] = {}
     for log in sorted(worn, key=lambda l: l["date"]):
         for item_id in log.get("item_ids", []):
             w = wear.setdefault(item_id, {"count": 0, "last": ""})
             w["count"] += 1
             w["last"] = log["date"][:10]
-    available = [i for i in items if (i.get("status") or "dressing") == "dressing"]
-    if not available:
-        raise ClaudeError("Er hangt nog niets in je dressing (of alles is in de was). Voeg eerst kledingstukken toe.")
+    if packed is not None:
+        available = [i for i in items if i["id"] in packed]
+        if not available:
+            raise ClaudeError("Je valies is nog leeg. Leg er eerst kleren in.")
+    else:
+        available = [i for i in items if (i.get("status") or "dressing") == "dressing"]
+        if not available:
+            raise ClaudeError("Er hangt nog niets in je dressing (of alles is in de was). Voeg eerst kledingstukken toe.")
     names = {i["id"]: i.get("name") or i.get("kind") or "" for i in items}
     taste = []
     for log in sorted(worn, key=lambda l: l["date"], reverse=True)[:25]:
@@ -234,7 +282,8 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         if log.get("note"):
             line += f", '{log['note'][:120]}'"
         taste.append(line)
-    wardrobe = "Mijn dressing (één stuk per regel, id vooraan):\n" + "\n".join(_item_line(i, wear) for i in available)
+    where = "Mijn valies: ik ben op reis en heb enkel dit bij me" if packed is not None else "Mijn dressing"
+    wardrobe = f"{where} (één stuk per regel, id vooraan):\n" + "\n".join(_item_line(i, wear) for i in available)
     if profile:
         wardrobe = f"Over mij: {profile}\n\n{wardrobe}"
     if taste:
@@ -296,6 +345,38 @@ ITEM_TOOL = {
             "onderhoud": {"type": "string", "description": "Enkel als het label leesbaar is: wastemperatuur, niet in de droogkast, ..."},
         },
         "required": ["naam", "categorie", "kleuren"],
+    },
+}
+
+ORDER_SYSTEM = f"""Je helpt iemand de kleren die hij of zij online kocht in zijn of haar dressing te zetten. Je krijgt de tekst van een bestelbevestiging of verzendmail van een webwinkel (Zara, H&M, Mango, Zalando, COS, ...) en de afbeeldingen uit die mail, elk met zijn nummer [foto N]. Waar een afbeelding in de tekst stond, staat ook [foto N]; bij een PDF staan de afbeeldingen enkel vooraan, in de volgorde van de mail.
+
+Roep precies één keer de tool registreer_bestelling aan met elk gekocht kledingstuk, schoen of accessoire. Regels:
+- Sla over wat geen kleding is (cadeaubon, verzendkosten, draagtas, cosmetica, interieur) en wat geannuleerd of teruggestuurd werd. Een stuk dat meermaals besteld werd, staat er één keer in.
+- foto: het nummer N van de productfoto van dat stuk. Kijk naar de afbeeldingen zelf en naar waar ze in de mail staan. Een logo, banner, icoon of klein kleurstaaltje is geen productfoto; geen productfoto voor dat stuk: dan 0.
+- kleuren: staat de kleur niet als woord in de mail (enkel als staaltje of bolletje), lees ze dan af van het staaltje of de productfoto.
+- winkel: de naam van de webwinkel; merk enkel als het stuk van een ander merk is dan de winkel (bv. bij Zalando).
+- besteldatum als JJJJ-MM-DD, als die in de mail staat.
+- Neem naam, kleur, maat, prijs (het betaalde bedrag per stuk, als getal) en materiaal over uit de mail; vul de rest aan zoals je dit soort stuk kent, maar verzin geen details die je niet kan weten.
+- Schrijf in het Nederlands (Vlaams). naam is een korte, herkenbare naam zoals iemand het zelf zou noemen ("Ecru gebreide trui met ronde hals"), niet de productcode of de Engelse winkelnaam; kleuren met gewone Nederlandse kleurnamen, de hoofdkleur eerst.
+- categorie is één van: {", ".join(db.CATEGORIES)}. warmte en formaliteit van 1 tot 5 zoals bij het registreren van één stuk (warmte 1 heel licht tot 5 heel warm; formaliteit 1 sportief tot 5 feestelijk)."""
+
+_ORDER_PIECE = {**ITEM_TOOL["input_schema"]["properties"],
+                "maat": {"type": "string"}, "prijs": {"type": "number", "description": "Betaald bedrag per stuk in euro"},
+                "foto": {"type": "integer", "description": "Nummer N van de bijhorende [foto N], of 0"}}
+_ORDER_PIECE.pop("onderhoud")
+
+ORDER_TOOL = {
+    "name": "registreer_bestelling",
+    "description": "Registreer de gekochte kledingstukken uit de bestelmail in de dressing.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "winkel": {"type": "string"},
+            "besteldatum": {"type": "string", "description": "JJJJ-MM-DD"},
+            "stukken": {"type": "array", "items": {"type": "object", "properties": _ORDER_PIECE,
+                                                    "required": ["naam", "categorie", "kleuren", "foto"]}},
+        },
+        "required": ["winkel", "stukken"],
     },
 }
 

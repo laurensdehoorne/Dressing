@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from datetime import date, timedelta
 import urllib.parse
 import urllib.request
 
@@ -97,4 +98,62 @@ def describe(w: dict) -> str:
     for d in w.get("days", []):
         lines.append(f"- {d['label']} ({d['date']}): {d['summary']}, {d['min']} tot {d['max']} °C (gevoel {d['feels_min']} tot "
                      f"{d['feels_max']} °C), kans op neerslag {d['rain']} %, wind tot {d['wind']} km/u, uv-index {d['uv']}")
+    return "\n".join(lines)
+
+
+# MARK: - A trip: the days at the destination
+
+FORECAST_DAYS = 16  # Open-Meteo forecasts this far ahead
+
+
+def _trip_days(lat: float, lon: float, first: str, last: str) -> list[dict]:
+    query = urllib.parse.urlencode({
+        "latitude": lat, "longitude": lon, "timezone": "auto", "start_date": first, "end_date": last,
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_min,apparent_temperature_max,"
+                 "precipitation_probability_max,wind_speed_10m_max",
+    })
+    try:
+        d = _get(f"https://api.open-meteo.com/v1/forecast?{query}").get("daily") or {}
+    except (OSError, ValueError):
+        raise WeatherError("De weerdienst is niet bereikbaar.")
+    days = []
+    for i, day in enumerate(d.get("time") or []):
+        try:
+            days.append({"date": day, "summary": CODES.get(d["weather_code"][i], "wisselend"),
+                         "min": round(d["temperature_2m_min"][i]), "max": round(d["temperature_2m_max"][i]),
+                         "feels_min": round(d["apparent_temperature_min"][i]), "feels_max": round(d["apparent_temperature_max"][i]),
+                         "rain": d["precipitation_probability_max"][i], "wind": round(d["wind_speed_10m_max"][i])})
+        except (KeyError, IndexError, TypeError):
+            break
+    return days
+
+
+async def trip_forecast(place: dict, start: str, end: str) -> dict:
+    """The forecast for the days of a trip that lie within the forecast (today up to 16 days ahead); a trip further
+    away gets no days, and the stylist goes by the usual weather there in that season."""
+    today = date.today()
+    first, last = max(date.fromisoformat(start), today), min(date.fromisoformat(end), today + timedelta(days=FORECAST_DAYS - 1))
+    days: list[dict] = []
+    if first <= last:
+        key = (round(place["lat"], 2), round(place["lon"], 2), first.isoformat(), last.isoformat())
+        if (hit := _cache.get(key)) and time.monotonic() - hit[0] < CACHE_SECONDS:
+            days = hit[1]
+        else:
+            days = await asyncio.to_thread(_trip_days, place["lat"], place["lon"], first.isoformat(), last.isoformat())
+            _cache[key] = (time.monotonic(), days)
+    return {"place": place["name"], "start": start, "end": end, "days": days}
+
+
+def describe_trip(w: dict) -> str:
+    """The trip and its forecast as lines for the stylist."""
+    lines = [f"Ik ben op reis in {w['place']} van {w['start']} tot en met {w['end']}."]
+    if not w["days"]:
+        lines.append(f"Er is nog geen weersvoorspelling voor die dagen: ga uit van het gebruikelijke weer in {w['place']} in die periode.")
+        return "\n".join(lines)
+    lines.append(f"Weer in {w['place']}:")
+    for d in w["days"]:
+        lines.append(f"- {d['date']}: {d['summary']}, {d['min']} tot {d['max']} °C (gevoel {d['feels_min']} tot {d['feels_max']} °C), "
+                     f"kans op neerslag {d['rain']} %, wind tot {d['wind']} km/u")
+    if w["days"][-1]["date"] < w["end"]:
+        lines.append("Voor de dagen daarna is er nog geen voorspelling: ga uit van het gebruikelijke weer in die periode.")
     return "\n".join(lines)

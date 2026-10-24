@@ -13,6 +13,10 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   warmte (1-5), formaliteit (1-5), gelegenheden en stijl in. Een merk enkel als het op een label of logo te lezen is.
   Je kijkt het na en vult **waar het hangt** in (de vorige plaats staat al klaar, en eerdere plaatsen worden
   voorgesteld). Zonder sleutel of zonder foto kan je alles ook zelf invullen.
+- **Uit een bestelmail** (Zara, H&M, Zalando, …): plak de bevestiging of verzendmail van een online bestelling. De AI
+  haalt er elk kledingstuk uit, met naam, kleur, maat, prijs, besteldatum en de productfoto uit de mail (die haalt de
+  server op, enkel van adressen op het internet). Je vinkt aan wat je houdt, past soort of naam aan en zegt waar het
+  hangt (één plaats voor alles of per stuk). Wat al in je dressing lijkt te hangen, staat uitgevinkt.
 - **Dressing**: alle stukken als raster met foto, zoeken op naam, kleur, merk of plaats, filteren per soort,
   favorieten of wat er niet is, sorteren op recent, naam, meest of langst niet gedragen.
 - **Waar is het?** In de dressing, in de was, bij de stomerij, uitgeleend of opgeborgen (ander seizoen). Enkel wat
@@ -25,6 +29,11 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   - je **scores en notities** bij eerdere outfits,
   - wat je bij **Instellingen → Over jou** over je stijl schreef.
   Ontbreekt er iets wezenlijks (een regenjas, nette schoenen), dan zegt hij dat als koopadvies.
+- **Valies**: zeg waar en wanneer je op reis gaat en tik aan wat je meeneemt (of laat de stylist helpen inpakken en leg
+  een voorgestelde outfit met één tik in de valies). Bij **Wat aantrekken?** kies je dan *Thuis* of de reis: op reis kiest
+  de stylist enkel uit je valies, met het weer op je bestemming voor de reisdagen (tot 16 dagen vooruit; verder weg gaat
+  hij uit van het gebruikelijke weer daar). Vanaf de dag voor vertrek staat de reis vanzelf aan. Terug thuis maak je de
+  valies leeg.
 - **Gedragen**: noteer wat je droeg (vanuit een voorstel, bij een stuk of zelf samengesteld), met datum,
   gelegenheid, sterren en notitie. Bij elk stuk zie je hoe vaak en wanneer het laatst gedragen werd.
 - **Outfit rond dit stuk**: vanuit een kledingstuk meteen een outfit eromheen vragen.

@@ -1,15 +1,21 @@
 """Dressing server: JSON API + the installable web app."""
 
 import asyncio
+import base64
 import io
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager, closing
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -18,6 +24,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+import pypdf
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
@@ -64,7 +71,7 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
 
 # The most a request may send; only a signed-in account may upload photos.
 MAX_BODY, MAX_UPLOAD = 1_000_000, 30_000_000
-UPLOADS = {"/api/identify"}
+UPLOADS = {"/api/identify", "/api/order/pdf"}
 
 
 class LimitBody:
@@ -367,6 +374,7 @@ def state(user: User):
             "seasons": db.SEASONS, "formality": db.FORMALITY, "warmth": db.WARMTH,
             "ai": _ai_info(user),
             "place": settings.get("place"),
+            "trip": settings.get("trip"),
             "profile": settings.get("profile") or "",
             "version": VERSION,
         }
@@ -631,9 +639,195 @@ async def _identify(user: dict, raw: bytes, hint: str):
     return {"info": await claude.identify_item(user, upload, hint.strip() or None), "photo_token": token}
 
 
+class OrderIn(BaseModel):
+    text: str
+    photos: list[str] = []
+
+
+MAX_ORDER_PHOTOS = 40
+
+
+@app.post("/api/order")
+async def read_order(body: OrderIn, user: AIUser, request: Request):
+    """The pieces in a pasted order confirmation; the product photos it showed (the app sends their addresses, as
+    [foto N] in the text) are fetched and kept briefly, as with recognising one piece."""
+    text = body.text.strip()[:40000]
+    if len(text) < 20:
+        raise HTTPException(400, "Plak de volledige bestelmail.")
+    urls = [u for u in body.photos[:MAX_ORDER_PHOTOS] if isinstance(u, str)]
+
+    async def fetched_then_read():
+        claude.report(step="Foto's ophalen")
+        got = await asyncio.gather(*(asyncio.to_thread(_fetch_photo, u) for u in urls))
+        return await _read_order(user, text, {n: jpeg for n, jpeg in enumerate(got, 1) if jpeg})
+    return await _background(request, user, fetched_then_read())
+
+
+@app.post("/api/order/pdf")
+async def read_order_pdf(user: AIUser, request: Request, pdf: UploadFile = File(...)):
+    """The same from the mail saved or printed as PDF: its text, and the pictures in it in their order."""
+    raw = await pdf.read()
+    text, photos = await asyncio.to_thread(_pdf_contents, raw)
+    if len(text.strip()) < 20:
+        raise HTTPException(400, "In deze PDF staat geen leesbare tekst. Kies de PDF van de bestelmail.")
+    return await _background(request, user, _read_order(user, text[:40000], photos))
+
+
+def _pdf_contents(raw: bytes) -> tuple[str, dict[int, bytes]]:
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(raw))
+        pages = list(reader.pages)[:10]
+    except Exception:
+        raise HTTPException(400, "Dit bestand kon niet als PDF gelezen worden.")
+    text, photos = [], {}
+    for page in pages:
+        try:
+            text.append(page.extract_text() or "")
+        except Exception:
+            continue
+        try:
+            images = list(page.images)
+        except Exception:
+            images = []
+        for image in images:
+            if len(photos) >= MAX_ORDER_PHOTOS:
+                break
+            try:
+                size = Image.open(io.BytesIO(image.data)).size
+                if min(size) >= 12:  # colour swatches count: the AI reads the colour from them
+                    photos[len(photos) + 1] = _jpeg(image.data, 1200, 85)
+            except Exception:
+                continue
+    return "\n".join(text), photos
+
+
+def _public_host(url: str) -> bool:
+    """Only https to an address on the internet: never this server, the tailnet or the home network."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        return False
+    try:
+        found = socket.getaddrinfo(parts.hostname, parts.port or 443, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False
+    return bool(found) and all(ipaddress.ip_address(f[4][0]).is_global for f in found)
+
+
+class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _public_host(newurl):
+            raise urllib.error.URLError("redirect to a private address")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_CheckedRedirect)
+
+
+def _fetch_photo(url: str) -> bytes | None:
+    """A picture from a web shop's mail, or None when it can't be had (gone, not a picture, too large)."""
+    if not _public_host(url):
+        return None
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Dressing)", "Accept": "image/*"})
+    try:
+        with _opener.open(req, timeout=10) as resp:
+            if not resp.headers.get("Content-Type", "").startswith("image/"):
+                return None
+            data = resp.read(MAX_UPLOAD + 1)
+    except (OSError, ValueError):
+        return None
+    if len(data) > MAX_UPLOAD:
+        return None
+    try:
+        return _jpeg(data, 1200, 78)
+    except HTTPException:
+        return None
+
+
+def _big_enough(jpeg: bytes) -> bool:
+    """A product photo, not a colour swatch the AI picked by mistake."""
+    return min(Image.open(io.BytesIO(jpeg)).size) >= 40
+
+
+async def _read_order(user: dict, text: str, photos: dict[int, bytes]):
+    found = await claude.read_order(user, text, {n: _jpeg(jpeg, 512, 75) for n, jpeg in photos.items()})
+    pieces = []
+    for p in found["pieces"]:
+        token = thumb = None
+        if (jpeg := photos.get(p["photo"])) and _big_enough(jpeg):
+            token = db.new_id().replace("-", "")
+            (db.TMP_DIR / f"{token}.jpg").write_bytes(jpeg)  # each piece its own copy: the token moves the file
+            thumb = "data:image/jpeg;base64," + base64.b64encode(_jpeg(jpeg, 240, 72)).decode()
+        pieces.append({"info": p["info"], "photo_token": token, "thumb": thumb})
+    return {"shop": found["shop"], "date": found["date"], "pieces": pieces}
+
+
+# MARK: - The suitcase: one trip at a time, with where, when and what is packed
+
+class TripIn(BaseModel):
+    destination: str
+    start: str
+    end: str
+
+
+def _trip(user: dict) -> dict | None:
+    return auth.user_settings(user).get("trip")
+
+
+@app.put("/api/trip")
+async def set_trip(body: TripIn, user: User):
+    """Where and when; what is already packed stays in the suitcase."""
+    try:
+        start, end = date.fromisoformat(body.start[:10]), date.fromisoformat(body.end[:10])
+    except ValueError:
+        raise HTTPException(400, "Geef de dag van vertrek en van terugkomst.")
+    if end < start:
+        raise HTTPException(400, "De terugkomst ligt voor het vertrek.")
+    if (end - start).days > 92:
+        raise HTTPException(400, "Een reis van meer dan drie maanden? Kies kortere data.")
+    old = _trip(user) or {}
+    name = body.destination.strip()
+    if not name:
+        raise HTTPException(400, "Waar ga je naartoe?")
+    place = old["place"] if old.get("place", {}).get("query") == name else {**await weather.find_place(name), "query": name}
+    trip = {"place": place, "start": start.isoformat(), "end": end.isoformat(), "item_ids": old.get("item_ids", [])}
+    auth.put_user_setting(user, "trip", trip)
+    return {"trip": trip}
+
+
+class PackedIn(BaseModel):
+    item_ids: list[str]
+
+
+@app.put("/api/trip/items")
+def pack(body: PackedIn, user: User):
+    trip = _trip(user)
+    if not trip:
+        raise HTTPException(400, "Zeg eerst waar en wanneer je op reis gaat.")
+    with db.connect() as conn:
+        own = _own_item_ids(conn, user)
+    trip["item_ids"] = list(dict.fromkeys(i for i in body.item_ids if i in own))
+    auth.put_user_setting(user, "trip", trip)
+    return {"trip": trip}
+
+
+@app.delete("/api/trip")
+def end_trip(user: User):
+    auth.put_user_setting(user, "trip", None)
+    return {"trip": None}
+
+
+@app.get("/api/trip/weather")
+async def trip_weather(user: User):
+    trip = _trip(user)
+    if not trip:
+        raise HTTPException(404, "Geen reis gepland.")
+    return await weather.trip_forecast(trip["place"], trip["start"], trip["end"])
+
+
 class StylistIn(BaseModel):
     query: str
     use_weather: bool = True
+    trip: bool = False  # on the trip: from the suitcase (or, while it is empty, to pack) with the destination's weather
 
 
 @app.post("/api/stylist")
@@ -641,13 +835,22 @@ async def stylist(body: StylistIn, user: AIUser, request: Request):
     query = body.query.strip()[:1000]
     if not query:
         raise HTTPException(400, "Waarvoor zoek je een outfit?")
-    return await _background(request, user, _stylist(user, query, body.use_weather))
+    return await _background(request, user, _stylist(user, query, body.use_weather, body.trip))
 
 
-async def _stylist(user: dict, query: str, use_weather: bool):
+async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = False):
     settings = auth.user_settings(user)
-    forecast, weather_text = None, ""
-    if use_weather and (place := settings.get("place")):
+    forecast, weather_text, packed = None, "", None
+    if on_trip and (trip := settings.get("trip")):
+        packed = trip["item_ids"] or None  # an empty suitcase: the stylist helps to pack from the dressing
+        claude.report(step="Weer op je bestemming opvragen")
+        try:
+            weather_text = weather.describe_trip(await weather.trip_forecast(trip["place"], trip["start"], trip["end"]))
+        except weather.WeatherError:
+            weather_text = f"Ik ben op reis in {trip['place']['name']} van {trip['start']} tot en met {trip['end']}."
+        if not packed:
+            weather_text += "\nIk moet nog inpakken: stel outfits voor die ik meeneem, die onderling goed combineren."
+    elif use_weather and (place := settings.get("place")):
         claude.report(step="Weer opvragen")
         try:
             forecast = await weather.forecast(place)
@@ -657,7 +860,8 @@ async def _stylist(user: dict, query: str, use_weather: bool):
     with db.connect() as conn:
         items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ?", (user["id"],))]
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ?", (user["id"],))]
-    result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "")
+    result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
+                                          packed=packed)
     return {**result, "weather": forecast}
 
 
