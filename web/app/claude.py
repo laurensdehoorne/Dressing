@@ -194,15 +194,35 @@ def _order_piece(got: dict, shop: str, day: str) -> dict:
     return {k: v for k, v in info.items() if v not in (None, "", [])}
 
 
-async def read_order(user: dict, text: str, photos: dict[int, bytes]) -> dict:
+def _image(jpeg: bytes) -> dict:
+    return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(jpeg).decode()}}
+
+
+def _box(value, size: tuple[int, int]) -> list[int] | None:
+    """A rectangle [left, top, right, bottom] inside a screenshot of this size, big enough to be a product photo."""
+    try:
+        x0, y0, x1, y1 = (int(round(float(v))) for v in value)
+    except (TypeError, ValueError):
+        return None
+    w, h = size
+    x0, x1 = sorted((max(0, min(w, x0)), max(0, min(w, x1))))
+    y0, y1 = sorted((max(0, min(h, y0)), max(0, min(h, y1))))
+    return [x0, y0, x1, y1] if x1 - x0 >= 30 and y1 - y0 >= 30 else None
+
+
+async def read_order(user: dict, text: str, photos: dict[int, bytes], shots: list[tuple[bytes, tuple[int, int]]] = ()) -> dict:
     """The pieces of clothing in an order confirmation (Zara, H&M, Mango, ...), each with the number of its photo when it
     has one. The AI sees the pictures (small JPEGs by number): to match them to the pieces, and for the colour when the
-    mail only shows a swatch."""
+    mail only shows a swatch. From screenshots (JPEG and its size) it reads everything, and says where each piece's
+    photo is on them so it can be cut out."""
     content: list = []
     for n, jpeg in photos.items():
-        content.append({"type": "text", "text": f"[foto {n}]"})
-        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(jpeg).decode()}})
-    content.append({"type": "text", "text": f"Vandaag is het {date.today().isoformat()}.\n\nDe bestelmail:\n{text}"})
+        content += [{"type": "text", "text": f"[foto {n}]"}, _image(jpeg)]
+    for n, (jpeg, (w, h)) in enumerate(shots, 1):
+        content += [{"type": "text", "text": f"[screenshot {n}: {w}×{h} pixels]"}, _image(jpeg)]
+    question = f"Vandaag is het {date.today().isoformat()}."
+    question += f"\n\nDe bestelmail:\n{text}" if text else "\n\nLees de bestelling van de screenshots hierboven."
+    content.append({"type": "text", "text": question})
     report(step="Bestelling lezen")
     got = await _timed(_ask(user, ORDER_TOOL, system=ORDER_SYSTEM, content=content))
     shop = str(got.get("winkel") or "").strip()[:80]
@@ -219,7 +239,14 @@ async def read_order(user: dict, text: str, photos: dict[int, bytes]) -> dict:
             photo = int(p.get("foto") or 0)
         except (TypeError, ValueError):
             photo = 0
-        pieces.append({"info": _order_piece(p, shop, day), "photo": photo if photo in photos else 0})
+        piece = {"info": _order_piece(p, shop, day), "photo": photo if photo in photos else 0}
+        try:
+            shot = int(p.get("screenshot") or 0)
+        except (TypeError, ValueError):
+            shot = 0
+        if 1 <= shot <= len(shots) and (box := _box(p.get("vak"), shots[shot - 1][1])):
+            piece["crop"] = (shot, box)
+        pieces.append(piece)
     return {"shop": shop, "date": day, "pieces": pieces}
 
 
@@ -353,6 +380,7 @@ ORDER_SYSTEM = f"""Je helpt iemand de kleren die hij of zij online kocht in zijn
 Roep precies één keer de tool registreer_bestelling aan met elk gekocht kledingstuk, schoen of accessoire. Regels:
 - Sla over wat geen kleding is (cadeaubon, verzendkosten, draagtas, cosmetica, interieur) en wat geannuleerd of teruggestuurd werd. Een stuk dat meermaals besteld werd, staat er één keer in.
 - foto: het nummer N van de productfoto van dat stuk. Kijk naar de afbeeldingen zelf en naar waar ze in de mail staan. Een logo, banner, icoon of klein kleurstaaltje is geen productfoto; geen productfoto voor dat stuk: dan 0.
+- Krijg je screenshots (van een mail, de app of de website van de winkel), lees dan alles af van de screenshots. Zet bij elk stuk screenshot (het nummer) en vak: de rechthoek rond de productfoto van dat stuk als [links, boven, rechts, onder] in pixels van die screenshot, zo nauw mogelijk rond de foto zelf, zonder tekst, knoppen of rand. Staat hetzelfde stuk op twee screenshots, kies de grootste foto. Geen productfoto te zien: laat vak weg. foto is dan 0.
 - kleuren: staat de kleur niet als woord in de mail (enkel als staaltje of bolletje), lees ze dan af van het staaltje of de productfoto.
 - winkel: de naam van de webwinkel; merk enkel als het stuk van een ander merk is dan de winkel (bv. bij Zalando).
 - besteldatum als JJJJ-MM-DD, als die in de mail staat.
@@ -362,7 +390,10 @@ Roep precies één keer de tool registreer_bestelling aan met elk gekocht kledin
 
 _ORDER_PIECE = {**ITEM_TOOL["input_schema"]["properties"],
                 "maat": {"type": "string"}, "prijs": {"type": "number", "description": "Betaald bedrag per stuk in euro"},
-                "foto": {"type": "integer", "description": "Nummer N van de bijhorende [foto N], of 0"}}
+                "foto": {"type": "integer", "description": "Nummer N van de bijhorende [foto N], of 0"},
+                "screenshot": {"type": "integer", "description": "Enkel bij screenshots: het nummer van de screenshot met de productfoto"},
+                "vak": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4,
+                        "description": "Enkel bij screenshots: [links, boven, rechts, onder] van de productfoto, in pixels"}}
 _ORDER_PIECE.pop("onderhoud")
 
 ORDER_TOOL = {

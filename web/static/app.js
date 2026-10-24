@@ -367,16 +367,23 @@ function renderOrder(page) {
     ${page.photos?.length ? `<p class="footnote">${plural(page.photos.length, "afbeelding", "afbeeldingen")} gevonden in de mail.</p>` : ""}
     ${page.error ? `<div class="notice err">${h(page.error)}</div>` : ""}
     <div class="buttons"><button class="btn-primary" data-act="read-order" ${aiReady() ? "" : "disabled"}>Lees de bestelling</button>
-      <label class="btn-secondary${aiReady() ? "" : " disabled"}">📄 Of kies de mail als PDF<input class="file-input" type="file" accept="application/pdf,.pdf" data-act-change="order-pdf" ${aiReady() ? "" : "disabled"}></label></div>
-    <p class="footnote">Een PDF maak je met Afdrukken → Bewaar als PDF. De foto's uit een geplakte mail zijn wel scherper.</p>`;
+      <label class="btn-secondary${aiReady() ? "" : " disabled"}">📄 Of kies de mail als PDF<input class="file-input" type="file" accept="application/pdf,.pdf" data-act-change="order-pdf" ${aiReady() ? "" : "disabled"}></label>
+      <label class="btn-secondary${aiReady() ? "" : " disabled"}">📱 Of kies screenshots<input class="file-input" type="file" accept="image/*" multiple data-act-change="order-shots" ${aiReady() ? "" : "disabled"}></label></div>
+    <p class="footnote">Een PDF maak je met Afdrukken → Bewaar als PDF. Screenshots mogen van de mail of van je bestelling in de app of op de
+      website van de winkel zijn, tot 6 tegelijk; de AI knipt de foto van elk stuk eruit. De foto's uit een geplakte mail zijn het scherpst.</p>`;
 }
 
-async function readOrder(page, pdf = null) {
-  if (!pdf && (page.text || "").trim().length < 20) { page.error = "Plak eerst de volledige bestelmail."; return render(); }
+async function readOrder(page, pdf = null, shots = null) {
+  if (!pdf && !shots && (page.text || "").trim().length < 20) { page.error = "Plak eerst de volledige bestelmail."; return render(); }
   Object.assign(page, { phase: "reading", error: null, step: "" });
   render();
   let path = "/api/order", opts = { method: "POST", json: { text: page.text, photos: page.photos || [] } };
   if (pdf) { const form = new FormData(); form.append("pdf", pdf, "bestelling.pdf"); path = "/api/order/pdf"; opts = { method: "POST", form }; }
+  if (shots) {
+    const form = new FormData();
+    for (const shot of shots) form.append("shots", await smaller(shot, 2400), "screenshot.jpg");
+    path = "/api/order/screenshots"; opts = { method: "POST", form };
+  }
   try {
     const r = await slowApi(path, opts,
       (p) => { if (p.step && p.step !== page.step) { page.step = p.step; if (stack.at(-1) === page) render(); } });
@@ -1058,6 +1065,11 @@ const changes = {
     if (await mutate(() => api(`/api/items/${page.id}/photo`, { method: "POST", form }))) { page.preview = null; render(); toast("Foto vervangen"); }
   },
   "order-pdf": (el) => { const file = el.files?.[0]; if (file) readOrder(stack.at(-1), file); },
+  "order-shots": (el) => {
+    const files = [...(el.files || [])];
+    if (files.length > 6) { stack.at(-1).error = "Kies hoogstens 6 screenshots."; return render(); }
+    if (files.length) readOrder(stack.at(-1), null, files);
+  },
   "use-weather": (el) => { ui.stylist.useWeather = el.checked; },
 };
 

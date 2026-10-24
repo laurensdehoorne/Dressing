@@ -287,3 +287,32 @@ def test_order_from_a_pdf_takes_its_pictures(client):
     r = client.post("/api/order/pdf", files={"pdf": ("b.pdf", out.getvalue(), "application/pdf")}, headers=H)
     assert r.status_code == 400 and "geen leesbare tekst" in r.json()["detail"]  # a picture only: nothing to read
     assert client.post("/api/order/pdf", files={"pdf": ("b.pdf", b"geen pdf", "application/pdf")}, headers=H).status_code == 400
+
+
+def test_order_from_screenshots_cuts_out_the_photos(client, monkeypatch):
+    shot = Image.new("RGB", (1170, 2532), "white")
+    shot.paste(Image.new("RGB", (400, 600), "navy"), (200, 400))  # the product photo on the screenshot
+    out = io.BytesIO()
+    shot.save(out, "PNG")
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low"):
+        seen["labels"] = [c["text"] for c in content if c["type"] == "text"]
+        w = 725  # the screenshot as the AI sees it: 1170×2532 brought to 1568 high
+        scale = w / 1170
+        box = [round(200 * scale), round(400 * scale), round(600 * scale), round(1000 * scale)]
+        return {"winkel": "H&M", "stukken": [
+            {"naam": "Marineblauwe trui", "categorie": "trui", "kleuren": ["marineblauw"], "foto": 0, "screenshot": 1, "vak": box},
+            {"naam": "Sokken", "categorie": "accessoire", "kleuren": ["wit"], "foto": 0, "screenshot": 1, "vak": [0, 0, 5, 5]}]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    r = client.post("/api/order/screenshots", files=[("shots", ("s.png", out.getvalue(), "image/png"))], headers=H)
+    assert r.status_code == 200, r.text
+    assert seen["labels"][0] == "[screenshot 1: 725×1568 pixels]" and "screenshots" in seen["labels"][-1]
+    trui, sokken = r.json()["pieces"]
+    assert trui["photo_token"] and not sokken["photo_token"]  # a box too small to be a photo: none
+    photo = Image.open(db.TMP_DIR / f"{trui['photo_token']}.jpg")
+    assert abs(photo.width - 400) < 6 and abs(photo.height - 600) < 6
+    r, g, b = photo.getpixel((photo.width // 2, photo.height // 2))
+    assert b > 100 and r < 50  # navy: the photo, not the white around it
+    too_many = [("shots", (f"{n}.png", out.getvalue(), "image/png")) for n in range(7)]
+    assert client.post("/api/order/screenshots", files=too_many, headers=H).status_code == 400

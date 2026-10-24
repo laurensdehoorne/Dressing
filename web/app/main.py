@@ -71,7 +71,7 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
 
 # The most a request may send; only a signed-in account may upload photos.
 MAX_BODY, MAX_UPLOAD = 1_000_000, 30_000_000
-UPLOADS = {"/api/identify", "/api/order/pdf"}
+UPLOADS = {"/api/identify", "/api/order/pdf", "/api/order/screenshots"}
 
 
 class LimitBody:
@@ -673,6 +673,40 @@ async def read_order_pdf(user: AIUser, request: Request, pdf: UploadFile = File(
     return await _background(request, user, _read_order(user, text[:40000], photos))
 
 
+MAX_SHOTS = 6
+SHOT_SIDE = 1568  # the longest side the AI sees; the photos are cut from the sharper original
+
+
+@app.post("/api/order/screenshots")
+async def read_order_screenshots(user: AIUser, request: Request, shots: list[UploadFile] = File(...)):
+    """The same from screenshots of the mail, or of the order in the shop's app or website; each piece's photo is
+    cut out of the screenshot."""
+    if len(shots) > MAX_SHOTS:
+        raise HTTPException(400, f"Kies hoogstens {MAX_SHOTS} screenshots.")
+    raws = [await shot.read() for shot in shots]
+    originals = [Image.open(io.BytesIO(_jpeg(raw, 3000, 90))) for raw in raws]
+    return await _background(request, user, _read_screenshots(user, originals))
+
+
+async def _read_screenshots(user: dict, originals: list[Image.Image]):
+    sent = []
+    for img in originals:
+        small = img.copy()
+        small.thumbnail((SHOT_SIDE, SHOT_SIDE))
+        out = io.BytesIO()
+        small.save(out, "JPEG", quality=82)
+        sent.append((out.getvalue(), small.size))
+    found = await claude.read_order(user, "", {}, sent)
+    for piece in found["pieces"]:
+        if crop := piece.pop("crop", None):
+            n, (x0, y0, x1, y1) = crop
+            img, scale = originals[n - 1], originals[n - 1].width / sent[n - 1][1][0]
+            out = io.BytesIO()
+            img.crop((round(x0 * scale), round(y0 * scale), round(x1 * scale), round(y1 * scale))).save(out, "JPEG", quality=85)
+            piece["jpeg"] = _jpeg(out.getvalue(), 1200, 80)
+    return _order_result(found, {})
+
+
 def _pdf_contents(raw: bytes) -> tuple[str, dict[int, bytes]]:
     try:
         reader = pypdf.PdfReader(io.BytesIO(raw))
@@ -750,10 +784,15 @@ def _big_enough(jpeg: bytes) -> bool:
 
 async def _read_order(user: dict, text: str, photos: dict[int, bytes]):
     found = await claude.read_order(user, text, {n: _jpeg(jpeg, 512, 75) for n, jpeg in photos.items()})
+    return _order_result(found, photos)
+
+
+def _order_result(found: dict, photos: dict[int, bytes]) -> dict:
+    """Each piece with its photo kept briefly (a token for saving it) and a small copy to show while choosing."""
     pieces = []
     for p in found["pieces"]:
         token = thumb = None
-        if (jpeg := photos.get(p["photo"])) and _big_enough(jpeg):
+        if (jpeg := p.get("jpeg") or photos.get(p["photo"])) and _big_enough(jpeg):
             token = db.new_id().replace("-", "")
             (db.TMP_DIR / f"{token}.jpg").write_bytes(jpeg)  # each piece its own copy: the token moves the file
             thumb = "data:image/jpeg;base64," + base64.b64encode(_jpeg(jpeg, 240, 72)).decode()

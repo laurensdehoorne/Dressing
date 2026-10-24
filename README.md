@@ -16,7 +16,9 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
 - **Uit een bestelmail** (Zara, H&M, Zalando, …): plak de bevestiging of verzendmail van een online bestelling. De AI
   haalt er elk kledingstuk uit, met naam, kleur, maat, prijs, besteldatum en de productfoto uit de mail (die haalt de
   server op, enkel van adressen op het internet). Je vinkt aan wat je houdt, past soort of naam aan en zegt waar het
-  hangt (één plaats voor alles of per stuk). Wat al in je dressing lijkt te hangen, staat uitgevinkt.
+  hangt (één plaats voor alles of per stuk). Het kan ook met de mail als **PDF**, of met tot 6 **screenshots** van de
+  mail of van je bestelling in de app of op de website van de winkel: dan knipt de AI de foto van elk stuk uit de
+  screenshot. Wat al in je dressing lijkt te hangen, staat uitgevinkt.
 - **Dressing**: alle stukken als raster met foto, zoeken op naam, kleur, merk of plaats, filteren per soort,
   favorieten of wat er niet is, sorteren op recent, naam, meest of langst niet gedragen.
 - **Waar is het?** In de dressing, in de was, bij de stomerij, uitgeleend of opgeborgen (ander seizoen). Enkel wat
