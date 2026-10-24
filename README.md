@@ -1,0 +1,89 @@
+# Dressing
+
+Houd je kleerkast bij: neem een foto van een kledingstuk, de AI (Claude van Anthropic) ziet wat het is, welke kleur,
+stof en stijl, en jij zegt waar het hangt. Daarna stelt de stylist outfits voor uit je eigen dressing voor een
+gelegenheid, het weer of een stemming, zoals de sommelier van de Wijnkelder dat doet met je wijnen.
+
+De app staat in [`web/`](web/): een eigen server (FastAPI + SQLite) met een installeerbare webapp, in Docker, bereikbaar
+via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
+
+## Functies
+
+- **Kledingstuk toevoegen met een foto**: de AI vult naam, soort, kleuren, patroon, materiaal, pasvorm, seizoenen,
+  warmte (1-5), formaliteit (1-5), gelegenheden en stijl in. Een merk enkel als het op een label of logo te lezen is.
+  Je kijkt het na en vult **waar het hangt** in (de vorige plaats staat al klaar, en eerdere plaatsen worden
+  voorgesteld). Zonder sleutel of zonder foto kan je alles ook zelf invullen.
+- **Dressing**: alle stukken als raster met foto, zoeken op naam, kleur, merk of plaats, filteren per soort,
+  favorieten of wat er niet is, sorteren op recent, naam, meest of langst niet gedragen.
+- **Waar is het?** In de dressing, in de was, bij de stomerij, uitgeleend of opgeborgen (ander seizoen). Enkel wat
+  in de dressing hangt, komt in een outfit.
+- **Wat aantrekken?** Beschrijf de gelegenheid, het weer of een stemming, of tik een voorstel aan. De stylist stelt 1
+  tot 3 complete outfits voor met foto's en de plaats van elk stuk, zegt waarom en geeft een stylingtip. Hij houdt
+  rekening met:
+  - het **weer** van vandaag en morgen in je woonplaats (Open-Meteo, gratis en zonder sleutel; uit te zetten per vraag),
+  - wat je **laatst droeg** (afwisselen, en stukken die lang niet gedragen zijn eens bovenhalen),
+  - je **scores en notities** bij eerdere outfits,
+  - wat je bij **Instellingen → Over jou** over je stijl schreef.
+  Ontbreekt er iets wezenlijks (een regenjas, nette schoenen), dan zegt hij dat als koopadvies.
+- **Gedragen**: noteer wat je droeg (vanuit een voorstel, bij een stuk of zelf samengesteld), met datum,
+  gelegenheid, sterren en notitie. Bij elk stuk zie je hoe vaak en wanneer het laatst gedragen werd.
+- **Outfit rond dit stuk**: vanuit een kledingstuk meteen een outfit eromheen vragen.
+- **Accounts**: zoals de Wijnkelder. De eerste gebruiker wordt beheerder en maakt andere accounts aan; elk account
+  ziet enkel zijn eigen kleren. Een rem op foute wachtwoorden en een log van aanmeldingen.
+- **Eigen API-sleutel per account**, versleuteld met het wachtwoord van dat account (AES-GCM, sleutel afgeleid met
+  scrypt): niet leesbaar in de database of in back-ups. De beheerder kan terugvallen op `ANTHROPIC_API_KEY` uit `.env`.
+- **Model** naar keuze bij Instellingen (standaard `claude-sonnet-5-5`, of `CLAUDE_MODEL` in `.env`). Een foto
+  herkennen of een outfit vragen kost meestal minder dan een cent.
+- Installeerbaar op het beginscherm (iPhone: Delen → *Zet op beginscherm*), licht en donker thema.
+- Elke dag een kopie van de database in `data/backups/` (14 dagen bewaard).
+
+## Installeren in een LXC met Docker (naast Butler)
+
+`web/compose.tailscale.yaml` zet een eigen Tailscale-container naast Dressing (zoals bij Butler). Dressing deelt diens
+netwerk, opent **geen poort op de host** en is enkel bereikbaar op `https://dressing.<jouw-tailnet>.ts.net`, met een
+geldig certificaat via `tailscale serve` (`web/tailscale/serve.json`). Zo kan hij in dezelfde LXC als Butler draaien:
+elke app heeft zijn eigen Tailscale-node, hostnaam en containers (`dressing`, `dressing-tailscale`).
+
+```bash
+git clone git@github.com:laurensdehoorne/Dressing.git /opt/dressing
+cd /opt/dressing/web
+cp .env.example .env            # TS_AUTHKEY invullen (Tailscale-admin → Settings → Keys, met tag:docker)
+docker compose -f compose.tailscale.yaml up -d --build
+```
+
+- De node krijgt de tag uit `TS_TAG`, standaard **`tag:docker`** (moet in `tagOwners` van je tailnet policy staan).
+- HTTPS moet aanstaan in de Tailscale-admin (*DNS → HTTPS Certificates*).
+- De login van de node staat in `web/ts-state/`; na de eerste start mag `TS_AUTHKEY` uit `.env`.
+- Open de app, maak het beheerdersaccount aan en vul bij **Instellingen** je Anthropic API-sleutel in
+  (console.anthropic.com) en je woonplaats voor het weer.
+
+Zonder Tailscale-container kan ook: `docker compose up -d --build` publiceert de app op `127.0.0.1:8081` van de host.
+
+## Bijwerken
+
+```bash
+/opt/dressing/web/update.sh
+```
+
+Haalt de nieuwste versie op en bouwt enkel opnieuw als er iets veranderd is, met dezelfde opzet als nu draait (met of
+zonder Tailscale-container). Via cron, bv. elk kwartier:
+
+```
+*/15 * * * * root /opt/dressing/web/update.sh >> /var/log/dressing-update.log 2>&1
+```
+
+## Gegevens
+
+Alles staat in `web/data/`: `dressing.db` (SQLite), `photos/` (één JPEG per kledingstuk, max. 1200 px) en
+`backups/`. Neem die map mee in je back-up.
+
+## Ontwikkelen
+
+```bash
+cd web
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+DATA_DIR=data .venv/bin/uvicorn app.main:app --reload --port 8766
+.venv/bin/pytest
+```
+
+De tests vervangen de AI en het weer door nepversies; ze kosten niets.

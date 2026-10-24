@@ -1,0 +1,6 @@
+anthropic>=1.11,<2
+fastapi>=0.142,<1
+uvicorn[standard]>=0.54,<1
+pillow>=12,<13
+python-multipart>=0.0.32
+cryptography>=43

@@ -1,0 +1,11 @@
+# Web app: secrets, local data and environments
+.env
+web/.venv/
+web/data/
+__pycache__/
+.pytest_cache/
+
+# Local tooling
+.claude/
+.DS_Store
+web/ts-state/
