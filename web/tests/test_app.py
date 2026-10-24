@@ -765,10 +765,66 @@ def test_outfit_without_shoes_is_completed(client, monkeypatch):
     asked.clear()
     r = client.post("/api/stylist", json={"query": "etentje", "use_weather": False}, headers=H).json()
     assert len(asked) == 2 and r["advice"] == "Eerst." and r["outfits"][0]["item_ids"] == [hemd["id"], broek["id"]]
-    answers[0] = answers[1] = {"advies": "Goed.", "outfits": [{"titel": "Ok", "stukken": [hemd["id"], laarzen["id"]], "waarom": "."}]}
+    answers[0] = answers[1] = {"advies": "Goed.", "outfits": [{"titel": "Ok", "stukken": [hemd["id"], broek["id"], laarzen["id"]], "waarom": "."}]}
     asked.clear()
     client.post("/api/stylist", json={"query": "etentje", "use_weather": False}, headers=H)
     assert len(asked) == 1
+
+
+def test_outfit_is_checked_for_completeness_and_doubles(client, monkeypatch):
+    hemd, trui = add(client, name="Wit hemd"), add(client, name="Grijze trui", category="trui")
+    broek, jeans = add(client, name="Zwarte broek", category="broek"), add(client, name="Jeans", category="broek")
+    kleed, jas = add(client, name="Zwart kleed", category="kleed"), add(client, name="Trenchcoat", category="jas")
+    sneakers = add(client, name="Sneakers", category="schoenen")
+    client.post("/api/rejected", json={"item_ids": [hemd["id"], broek["id"], sneakers["id"]], "reasons": ["Te formeel"]}, headers=H)
+    by_id = {i["id"]: i for i in client.get("/api/state").json()["items"]}
+    refused = [frozenset({hemd["id"], broek["id"], sneakers["id"]})]
+
+    def check(*outfits):
+        got = {"outfits": [{"titel": t, "stukken": ids} for t, ids in outfits]}
+        return claude._outfits(got, by_id, 0, refused)[1]
+
+    assert check(("A", [hemd["id"], jeans["id"], sneakers["id"]])) == []
+    assert check(("A", [kleed["id"], jas["id"], sneakers["id"]])) == []
+    assert check(("A", [hemd["id"], trui["id"], jeans["id"], sneakers["id"]])) == []  # a shirt under a sweater is fine
+    assert check(("A", [hemd["id"], broek["id"], jeans["id"], sneakers["id"]])) == ["Outfit 'A' heeft twee broeken: hou er één."]
+    assert check(("A", [kleed["id"], jeans["id"], sneakers["id"]])) == ["Outfit 'A' heeft een kleed of jumpsuit én een onderstuk: kies een van beide."]
+    assert check(("A", [hemd["id"], sneakers["id"]])) == ["Outfit 'A' heeft geen onderstuk: kies een broek of rok uit de lijst bij."]
+    assert check(("A", [jeans["id"], jas["id"], sneakers["id"]])) == ["Outfit 'A' heeft geen bovenstuk: kies er een uit de lijst bij."]
+    assert check(("A", [hemd["id"], jeans["id"]])) == ["Outfit 'A' heeft geen schoenen: kies er een paar uit de lijst bij."]
+    assert check(("A", [hemd["id"], broek["id"], sneakers["id"]])) == ["Outfit 'A' is precies een outfit dat ik al afwees: stel iets anders voor."]
+    assert check(("A", [hemd["id"], jeans["id"], sneakers["id"]]), ("B", [sneakers["id"], jeans["id"], hemd["id"]])) == [
+        "Outfit 'B' is dezelfde als outfit 'A': laat hem weg of maak hem echt anders."]
+    # With a dressing without trousers, an outfit without them is fine.
+    only_tops = {k: v for k, v in by_id.items() if v["category"] != "broek"}
+    assert claude._outfits({"outfits": [{"titel": "A", "stukken": [hemd["id"], sneakers["id"]]}]}, only_tops)[1] == []
+
+
+def test_stylist_sees_what_a_piece_is_for_and_what_was_worn_lately(client, monkeypatch):
+    from datetime import date, timedelta
+    hemd = add(client, name="Wit hemd", occasions=["kantoor", "etentje"], description="Strak hemd, mooi onder een blazer.",
+               notes="Knelt wat aan de kraag")
+    jeans = add(client, name="Jeans", category="broek")
+    client.post("/api/rejected", json={"item_ids": [hemd["id"], jeans["id"]], "reasons": ["Kleuren botsen"]}, headers=H)
+    client.post("/api/rejected", json={"item_ids": [hemd["id"]], "reasons": ["Draag ik niet graag"]}, headers=H)
+    lately, long_ago = (date.today() - timedelta(days=3)).isoformat(), (date.today() - timedelta(days=60)).isoformat()
+    for day, data in ((lately, {}), (long_ago, {}), (long_ago, {"rating": 5})):
+        r = client.post("/api/worn", json={"item_ids": [jeans["id"]], "date": day, **data}, headers=H)
+        assert r.status_code == 200, r.text
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
+        seen["text"] = content[0]["text"]
+        return {"advies": "", "outfits": []}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    line = next(l for l in seen["text"].splitlines() if l.startswith(hemd["id"]))
+    assert "voor kantoor, etentje" in line and "Strak hemd, mooi onder een blazer." in line and "notitie 'Knelt wat aan de kraag'" in line
+    assert "2× in een afgewezen outfit" in line
+    assert "1× in een afgewezen outfit" in next(l for l in seen["text"].splitlines() if l.startswith(jeans["id"]))
+    worn = seen["text"].split("Wat ik eerder droeg en hoe het viel:\n")[1].split("\n\n")[0].splitlines()
+    assert [w[:10] for w in worn] == [lately, long_ago]  # lately, rated or not; long ago only with a score
+    assert claude._short("een twee drie vier", 9) == "een twee…"
 
 
 def test_follow_up_keeps_every_outfit(client, monkeypatch):

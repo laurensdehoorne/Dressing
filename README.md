@@ -32,6 +32,8 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   - wat je bij **Instellingen → Over jou** over je stijl schreef,
   - je **stijl uit Inspiratie** (zie hieronder).
   Ontbreekt er iets wezenlijks (een regenjas, nette schoenen), dan zegt hij dat als koopadvies.
+  Zijn antwoord wordt nagekeken (een onderstuk en bovenstuk of een kleed, schoenen, niets dubbel, geen outfit dat je al afwees,
+  geen twee keer hetzelfde) en zo nodig één keer verbeterd.
 - **Valies**: zeg waar en wanneer je op reis gaat en tik aan wat je meeneemt (of laat de stylist helpen inpakken en leg
   een voorgestelde outfit met één tik in de valies). Bij **Wat aantrekken?** kies je dan *Thuis* of de reis: op reis kiest
   de stylist enkel uit je valies, met het weer op je bestemming voor de reisdagen (tot 16 dagen vooruit; verder weg gaat

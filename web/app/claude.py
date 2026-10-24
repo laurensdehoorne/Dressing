@@ -6,7 +6,7 @@ import base64
 import contextvars
 import os
 from collections.abc import Awaitable, Callable
-from datetime import date
+from datetime import date, timedelta
 
 import anthropic
 
@@ -360,8 +360,9 @@ def _rejected_line(r: dict, names: dict[str, str]) -> str:
     return line + (": " + ", ".join(why) if why else "")
 
 
-def _item_line(item: dict, wear: dict) -> str:
-    """One piece for the stylist: only what it needs to choose, to keep the question small."""
+def _item_line(item: dict, wear: dict, refused: dict[str, int] | None = None) -> str:
+    """One piece for the stylist: only what it needs to choose, to keep the question small. refused: how often each
+    piece was in an outfit the user turned down."""
     parts = [item["id"], db.CATEGORIES.get(item.get("category"), "?")]
     parts += [item.get(k) for k in ("kind", "name") if item.get(k)]
     if item.get("colors"):
@@ -375,15 +376,38 @@ def _item_line(item: dict, wear: dict) -> str:
         parts.append(f"formeel {item['formality']}/5")
     if item.get("seasons"):
         parts.append("seizoen " + "/".join(item["seasons"]))
+    if item.get("occasions"):
+        parts.append("voor " + ", ".join(item["occasions"][:5]))
     if item.get("style_tags"):
         parts.append("stijl " + ", ".join(item["style_tags"][:5]))
+    if item.get("description"):
+        parts.append(_short(item["description"], 160))
+    if item.get("notes"):
+        parts.append(f"notitie '{_short(item['notes'], 100)}'")
     if item.get("favorite"):
         parts.append("favoriet")
     if w := wear.get(item["id"]):
         parts.append(f"{w['count']}× gedragen, laatst {w['last']}")
     else:
         parts.append("nog nooit gedragen")
+    if n := (refused or {}).get(item["id"]):
+        parts.append(f"{n}× in een afgewezen outfit")
     return " | ".join(str(p) for p in parts)
+
+
+def _short(text: str, limit: int) -> str:
+    """One line of at most limit characters, cut at a word."""
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+# What a piece does in an outfit, by category: to check that an outfit is complete and has nothing twice.
+_BOTTOMS = {"broek", "rok"}
+_TOPS = {"top", "trui", "blazer", "sport"}
+_ONE_OF = {"broek": "broeken", "rok": "rokken", "kleed": "kleedjes", "jas": "jassen", "schoenen": "paar schoenen"}
+RECENT_DAYS = 14  # what was worn in the last two weeks goes to the stylist, rated or not, to alternate
 
 
 async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[dict], *, weather: str = "",
@@ -411,9 +435,13 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         if not available:
             raise ClaudeError("Er hangt nog niets in je dressing (of alles is in de was). Voeg eerst kledingstukken toe.")
     names = {i["id"]: i.get("name") or i.get("kind") or "" for i in items}
+    # The last two weeks in full (to alternate), older outfits only when they say how they went.
+    recent = (date.today() - timedelta(days=RECENT_DAYS)).isoformat()
     taste = []
-    for log in sorted(worn, key=lambda l: l["date"], reverse=True)[:25]:
-        if not (log.get("rating") or log.get("note") or log.get("occasion")):
+    for log in sorted(worn, key=lambda l: l["date"], reverse=True):
+        if len(taste) == 25:
+            break
+        if log["date"][:10] < recent and not (log.get("rating") or log.get("note") or log.get("occasion")):
             continue
         line = f"{log['date'][:10]}: " + " + ".join(names.get(i, "?") for i in log.get("item_ids", []))
         if log.get("occasion"):
@@ -423,8 +451,12 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         if log.get("note"):
             line += f", '{log['note'][:120]}'"
         taste.append(line)
+    refused_count: dict[str, int] = {}
+    for r in rejected:
+        for item_id in r.get("item_ids", []):
+            refused_count[item_id] = refused_count.get(item_id, 0) + 1
     where = "Mijn valies: ik ben op reis en heb enkel dit bij me" if packed is not None else "Mijn dressing"
-    wardrobe = f"{where} (één stuk per regel, id vooraan):\n" + "\n".join(_item_line(i, wear) for i in available)
+    wardrobe = f"{where} (één stuk per regel, id vooraan):\n" + "\n".join(_item_line(i, wear, refused_count) for i in available)
     if style:
         wardrobe = f"Mijn stijl, uit outfits die ik mooi vind:\n{style}\n\n{wardrobe}"
     if profile:
@@ -462,7 +494,9 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
     got = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=content, helpers=helpers,
                             effort="medium" if complex_ else "low", tier="complex" if complex_ else ""))
     by_id = {i["id"]: i for i in available}
-    outfits, problems = _outfits(got, by_id, len((previous or {}).get("outfits") or []))
+    refused_sets = [frozenset(r.get("item_ids", [])) for r in rejected]
+    expected = len((previous or {}).get("outfits") or [])
+    outfits, problems = _outfits(got, by_id, expected, refused_sets)
     if problems:
         # Asked once more with what is wrong, of the strongest model (tier "review"); kept when it is better.
         report(step="Outfits nakijken")
@@ -472,17 +506,22 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
                "\n\nRoep geef_outfits opnieuw aan met alle outfits, verbeterd. Verander verder niets aan wat goed was.")
         again = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=[*content, {"type": "text", "text": fix}],
                                   helpers=helpers, tier="review"))
-        better, left = _outfits(again, by_id, len((previous or {}).get("outfits") or []))
+        better, left = _outfits(again, by_id, expected, refused_sets)
         if better and len(left) < len(problems):
             got, outfits = again, better
     return {"advice": got.get("advies") or "", "outfits": outfits, "missing": got.get("ontbreekt") or ""}
 
 
-def _outfits(got: dict, by_id: dict[str, dict], expected: int = 0) -> tuple[list[dict], list[str]]:
+def _outfits(got: dict, by_id: dict[str, dict], expected: int = 0, refused: list[frozenset] = ()) -> tuple[list[dict], list[str]]:
     """The outfits in the stylist's answer, with only pieces from the list, and what is wrong with them: an id that
-    isn't in the list, no shoes while there are shoes to choose from, fewer outfits than the suggestion it adjusted."""
-    has_shoes = any(i.get("category") == "schoenen" for i in by_id.values())
+    isn't in the list, no shoes while there are shoes to choose from, no top or bottom while there are some, two
+    pieces that do the same (two trousers, two coats), the same outfit twice, an outfit the user turned down as is,
+    fewer outfits than the suggestion it adjusted."""
+    categories = {i.get("category") for i in by_id.values()}
+    has_shoes = "schoenen" in categories
+    has_bottoms, has_tops = bool(categories & _BOTTOMS), bool(categories & _TOPS)
     outfits, problems = [], []
+    seen: dict[frozenset, str] = {}
     for o in got.get("outfits") or []:
         if not isinstance(o, dict):
             continue
@@ -491,14 +530,37 @@ def _outfits(got: dict, by_id: dict[str, dict], expected: int = 0) -> tuple[list
         title = o.get("titel") or ""
         if unknown := [i for i in given if i not in by_id]:
             problems.append(f"Outfit '{title}' heeft id's die niet in de lijst staan: {', '.join(unknown[:5])}. Gebruik de id's precies zoals in de lijst.")
-        if ids and has_shoes and not any(by_id[i].get("category") == "schoenen" for i in ids):
-            problems.append(f"Outfit '{title}' heeft geen schoenen: kies er een paar uit de lijst bij.")
         if ids:
+            problems += [f"Outfit '{title}' {p}" for p in _wrong_with(ids, by_id, has_shoes, has_bottoms, has_tops)]
+            if frozenset(ids) in refused:
+                problems.append(f"Outfit '{title}' is precies een outfit dat ik al afwees: stel iets anders voor.")
+            if (same := seen.get(frozenset(ids))) is not None:
+                problems.append(f"Outfit '{title}' is dezelfde als outfit '{same}': laat hem weg of maak hem echt anders.")
+            seen.setdefault(frozenset(ids), title)
             outfits.append({"title": title, "item_ids": ids, "reason": o.get("waarom") or "", "tip": o.get("tip") or ""})
     if expected and len(outfits) < expected:
         problems.append(f"Je voorstel had {expected} outfits en je gaf er {len(outfits)} terug: geef ze alle {expected} terug, "
                         "elk aangepast zoals gevraagd.")
     return outfits, problems
+
+
+def _wrong_with(ids: list[str], by_id: dict[str, dict], has_shoes: bool, has_bottoms: bool, has_tops: bool) -> list[str]:
+    """What makes one outfit not wearable, given what the dressing has to offer."""
+    cats = [by_id[i].get("category") for i in ids]
+    wrong = []
+    for category, plural in _ONE_OF.items():
+        if cats.count(category) > 1:
+            wrong.append(f"heeft twee {plural}: hou er één.")
+    dress = "kleed" in cats
+    if dress and any(c in _BOTTOMS for c in cats):
+        wrong.append("heeft een kleed of jumpsuit én een onderstuk: kies een van beide.")
+    if not dress and has_bottoms and not any(c in _BOTTOMS for c in cats):
+        wrong.append("heeft geen onderstuk: kies een broek of rok uit de lijst bij.")
+    if not dress and has_tops and not any(c in _TOPS for c in cats):
+        wrong.append("heeft geen bovenstuk: kies er een uit de lijst bij.")
+    if has_shoes and "schoenen" not in cats:
+        wrong.append("heeft geen schoenen: kies er een paar uit de lijst bij.")
+    return wrong
 
 
 IDENTIFY_SYSTEM = f"""Je helpt iemand de kleren in zijn of haar dressing te registreren. Je krijgt een foto van één kledingstuk (op een hanger, opgevouwen, op de grond of gedragen) en/of een korte omschrijving. Beschrijf het belangrijkste kledingstuk op de foto, zo dat je het later uit een lijst kan herkennen en ermee outfits kan samenstellen.
@@ -612,8 +674,9 @@ INSPIRATION_TOOL = {
 STYLIST_SYSTEM = """Je bent de persoonlijke stylist van iemand en stelt outfits samen uitsluitend met kleren uit zijn of haar eigen dressing. De gebruiker beschrijft een gelegenheid, het weer, een stemming of een stuk dat erin moet. Stel 1 tot 3 outfits voor, de beste eerst, en roep precies één keer de tool geef_outfits aan. Gebruik enkel id's uit de lijst.
 
 Een outfit is compleet en draagbaar:
-- Een bovenstuk en een onderstuk, of een kleed of jumpsuit; altijd schoenen als die in de lijst staan (ook als je ze in waarom of tip vernoemt: dan horen ze bij stukken); een jas of vest als het weer of de gelegenheid dat vraagt; eventueel één of twee accessoires.
-- Nooit twee stukken die hetzelfde doen (twee broeken, twee paar schoenen).
+- Een bovenstuk (Tops & hemden, Truien & vesten, Blazers & pakken) en een onderstuk (Broeken & shorts, Rokken), of een kleed of jumpsuit; altijd schoenen als die in de lijst staan (ook als je ze in waarom of tip vernoemt: dan horen ze bij stukken); een jas of vest als het weer of de gelegenheid dat vraagt; eventueel één of twee accessoires.
+- Nooit twee stukken die hetzelfde doen (twee broeken, twee paar schoenen, twee jassen, een kleed met een broek). Een hemd onder een trui of een blazer over een top mag wel.
+- Stel je er meer dan één voor, dan verschillen ze echt van elkaar: een andere sfeer, een ander onder- of bovenstuk, niet dezelfde look met enkel andere schoenen.
 
 Kies zoals een stylist dat doet:
 - Het seizoen: kies stukken voor het seizoen van het moment waarover de vraag gaat (het staat bij de datum). Een stuk met andere seizoenen enkel als het weer er echt om vraagt (een warme dag in de herfst, een koude in de lente), en dan zo dat het outfit toch bij het seizoen past: in de herfst en winter donkerdere en warmere tinten en stoffen, in de lente en zomer lichtere. Een stuk zonder seizoenen kan het hele jaar. Op reis telt het seizoen niet: daar kies je enkel naar het weer ter plaatse (een zomerjurk voor de Canarische Eilanden in december).
@@ -621,8 +684,8 @@ Kies zoals een stylist dat doet:
 - De gelegenheid bepaalt hoe formeel (1-5): een sollicitatie of huwelijk vraagt meer dan een terrasje. Liever een tikje te verzorgd dan te slordig.
 - Kleuren die samengaan: neutrale basis (marine, grijs, beige, zwart, wit, ecru) met hoogstens één of twee accentkleuren; patronen hoogstens één opvallend stuk, tenzij ze bewust combineren. Materialen en stijl in dezelfde lijn.
 - Laat stukken die al lang niet of nog nooit gedragen zijn eens aan bod komen als ze goed passen, en wissel af met wat de laatste dagen al gedragen werd. Favorieten mogen vaker.
-- Wat de gebruiker eerder droeg en hoe het viel (score op 5, notitie), telt mee om te kiezen tussen outfits die al goed passen.
-- Outfits die de gebruiker afwees, stel je niet opnieuw voor (ook niet bijna hetzelfde). Leer van de reden: 'te formeel' bij een vraag voor kantoor betekent dat kantoor minder formeel mag; 'kleuren botsen' of 'combineer ik nooit' gaat over die combinatie van stukken; 'draag ik niet graag' over een van de stukken.
+- Wat de gebruiker eerder droeg en hoe het viel (score op 5, notitie), telt mee om te kiezen tussen outfits die al goed passen. Bij elk stuk staat waarvoor het dient ('voor kantoor, weekend'), hoe het combineert en een eventuele notitie van de gebruiker zelf ('knelt', 'enkel met riem'): neem die ernstig.
+- Outfits die de gebruiker afwees, stel je niet opnieuw voor (ook niet bijna hetzelfde). Leer van de reden: 'te formeel' bij een vraag voor kantoor betekent dat kantoor minder formeel mag; 'kleuren botsen' of 'combineer ik nooit' gaat over die combinatie van stukken; 'draag ik niet graag' over een van de stukken. Een stuk dat al vaker in een afgewezen outfit zat (dat staat erbij), kies je enkel nog als het echt het beste is.
 - Stuurt de gebruiker een vorig voorstel bij ('andere schoenen', 'minder chic'), geef dan alle outfits uit dat voorstel terug, in dezelfde volgorde, en verander in elk enkel wat gevraagd wordt; vraagt de gebruiker een heel ander idee, dan mag alles anders. Zeg in advies kort wat je veranderde, en noem daarbij enkel stukken die echt in het voorstel of in je nieuwe outfits staan.
 - Staat er een stijl uit outfits die de gebruiker mooi vindt, kies dan in die geest: dezelfde kleuren, silhouetten en combinaties waar de dressing dat toelaat. Het is smaak, geen filter: het weer en de gelegenheid gaan voor. Vraagt de gebruiker een look na te maken, benader die zo dicht mogelijk met eigen kleren en zeg in ontbreekt welk stuk de look echt zou afmaken.
 
