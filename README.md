@@ -1,6 +1,6 @@
 # Dressing
 
-Houd je kleerkast bij: neem een foto van een kledingstuk, de AI (Claude van Anthropic) ziet wat het is, welke kleur,
+Houd je kleerkast bij: neem een foto van een kledingstuk, de AI (Claude van Anthropic of ChatGPT van OpenAI) ziet wat het is, welke kleur,
 stof en stijl, en jij zegt waar het hangt. Daarna stelt de stylist outfits voor uit je eigen dressing voor een
 gelegenheid, het weer of een stemming, zoals de sommelier van de Wijnkelder dat doet met je wijnen.
 
@@ -30,9 +30,13 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
 - **Outfit rond dit stuk**: vanuit een kledingstuk meteen een outfit eromheen vragen.
 - **Accounts**: zoals de Wijnkelder. De eerste gebruiker wordt beheerder en maakt andere accounts aan; elk account
   ziet enkel zijn eigen kleren. Een rem op foute wachtwoorden en een log van aanmeldingen.
-- **Eigen API-sleutel per account**, versleuteld met het wachtwoord van dat account (AES-GCM, sleutel afgeleid met
-  scrypt): niet leesbaar in de database of in back-ups. De beheerder kan terugvallen op `ANTHROPIC_API_KEY` uit `.env`.
-- **Model** naar keuze bij Instellingen (standaard `claude-sonnet-5-5`, of `CLAUDE_MODEL` in `.env`). Een foto
+- **Claude of ChatGPT**, te kiezen per account bij **Instellingen → AI-dienst**. Je kan voor beide een sleutel
+  bewaren en wisselen wanneer je wil; de herkenning en de stylist stellen dezelfde vragen aan beide diensten.
+  ChatGPT loopt via de Responses API van OpenAI.
+- **Eigen API-sleutel per account** (per dienst), versleuteld met het wachtwoord van dat account (AES-GCM, sleutel afgeleid met
+  scrypt): niet leesbaar in de database of in back-ups. De beheerder kan terugvallen op `ANTHROPIC_API_KEY` of `OPENAI_API_KEY` uit `.env`.
+- **Model** naar keuze bij Instellingen, per dienst (standaard `claude-sonnet-5-5` en `gpt-6-luna`, of `CLAUDE_MODEL` en
+  `OPENAI_MODEL` in `.env`). Een foto
   herkennen of een outfit vragen kost meestal minder dan een cent.
 - Installeerbaar op het beginscherm (iPhone: Delen → *Zet op beginscherm*), licht en donker thema.
 - Elke dag een kopie van de database in `data/backups/` (14 dagen bewaard).
@@ -55,7 +59,7 @@ docker compose -f compose.tailscale.yaml up -d --build
 - HTTPS moet aanstaan in de Tailscale-admin (*DNS → HTTPS Certificates*).
 - De login van de node staat in `web/ts-state/`; na de eerste start mag `TS_AUTHKEY` uit `.env`.
 - Open de app, maak het beheerdersaccount aan en vul bij **Instellingen** je Anthropic API-sleutel in
-  (console.anthropic.com) en je woonplaats voor het weer.
+  (console.anthropic.com) of OpenAI API-sleutel (platform.openai.com) en je woonplaats voor het weer.
 
 Zonder Tailscale-container kan ook: `docker compose up -d --build` publiceert de app op `127.0.0.1:8081` van de host.
 

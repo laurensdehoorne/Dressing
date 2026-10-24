@@ -4,3 +4,4 @@ uvicorn[standard]>=0.54,<1
 pillow>=12,<13
 python-multipart>=0.0.32
 cryptography>=43
+openai>=3,<4

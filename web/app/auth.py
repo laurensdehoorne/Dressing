@@ -120,7 +120,7 @@ def set_password(conn, user_id: str, password: str, data_key: bytes | None = Non
 # unlocked and stored with that session, encrypted with a key derived from the session cookie, which the server
 # doesn't keep either (only a different hash of it). So the database and its backups hold no readable API key.
 
-SECRETS = ("api_key_enc",)  # settings that hold a secret encrypted with the data key (see keys.py)
+SECRETS = ("api_key_enc", "openai_key_enc")  # settings that hold a secret encrypted with the data key (see keys.py)
 
 
 def _b64(b: bytes) -> str:

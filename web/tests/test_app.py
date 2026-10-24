@@ -10,7 +10,9 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app import claude, db, main, weather
+from types import SimpleNamespace
+
+from app import claude, db, gpt, main, weather
 
 H = {"X-Dressing": "1"}
 
@@ -21,7 +23,7 @@ def client(monkeypatch):
     with db.connect() as conn:
         for table in ("worn", "items", "sessions", "login_failures", "audit_log", "users"):
             conn.execute(f"DELETE FROM {table}")
-    monkeypatch.setattr(main.keys, "active_key", lambda user: ("sk-ant-test", "env"))
+    monkeypatch.setattr(main.keys, "active_key", lambda user, name="claude": ("sk-test", "env"))
     with TestClient(main.app) as c:
         r = c.post("/api/auth/setup", json={"username": "laurens", "password": "geheim123"}, headers=H)
         assert r.status_code == 200
@@ -147,8 +149,53 @@ def test_api_key_is_stored_encrypted(client, monkeypatch):
     async def ok(key):
         return None
     monkeypatch.setattr(claude, "check_key", ok)
-    r = client.put("/api/settings/api-key", json={"key": "sk-ant-api03-abcdefghijkl"}, headers=H)
+    r = client.put("/api/settings/api-key", json={"key": "sk-ant-api03-zyxwvutsrqponmabcdefghijkl"}, headers=H)
     assert r.json()["api_key"]["hint"] == "sk-ant-…ijkl"
     with db.connect() as conn:
         assert "abcdefghijkl" not in conn.execute("SELECT settings FROM users").fetchone()[0]
-    assert client.get("/api/state").json()["api_key"]["source"] == "app"
+    assert client.get("/api/state").json()["ai"]["services"]["claude"]["api_key"]["source"] == "app"
+
+
+def test_chatgpt_answers_when_chosen(client, monkeypatch):
+    add(client, name="Wit hemd")
+    asked = {}
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            asked.update(kwargs)
+            call = SimpleNamespace(type="function_call", name="geef_outfits",
+                                   arguments='{"advies": "Ok.", "outfits": []}')
+            return SimpleNamespace(id="r1", output=[call], status="completed")
+    monkeypatch.setattr(gpt, "client", lambda user: SimpleNamespace(responses=FakeResponses()))
+
+    async def no_claude(*a, **k):
+        raise AssertionError("Claude was asked")
+    monkeypatch.setattr(claude, "_ask_claude", no_claude)
+    assert client.put("/api/settings/provider", json={"provider": "openai"}, headers=H).json()["provider"] == "openai"
+    r = client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["advice"] == "Ok."
+    assert asked["model"] == gpt.DEFAULT_MODEL and asked["tools"][0]["name"] == "geef_outfits"
+    assert asked["input"][1]["content"][0]["prompt_cache_breakpoint"]  # the dressing is cached, as with Claude
+    assert client.get("/api/state").json()["ai"]["provider"] == "openai"
+
+
+def test_chatgpt_reads_the_photo(monkeypatch):
+    parts = gpt._content([{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAA"}},
+                          {"type": "text", "text": "Beschrijf dit."}])
+    assert parts[0] == {"type": "input_image", "image_url": "data:image/jpeg;base64,AAA", "detail": "auto"}
+    assert parts[1] == {"type": "input_text", "text": "Beschrijf dit."}
+
+
+def test_openai_key_is_checked_and_kept_apart(client, monkeypatch):
+    monkeypatch.undo()
+
+    async def ok(key):
+        return None
+    monkeypatch.setattr(gpt, "check_key", ok)
+    bad = client.put("/api/settings/api-key", json={"key": "sk-ant-api03-abcdefghijklmnopqrstuvwxyz", "provider": "openai"}, headers=H)
+    assert bad.status_code == 400
+    r = client.put("/api/settings/api-key", json={"key": "sk-proj-abcdefghijklmnopqrstuvwxyz1234", "provider": "openai"}, headers=H)
+    assert r.status_code == 200, r.text
+    services = client.get("/api/state").json()["ai"]["services"]
+    assert services["openai"]["api_key"]["source"] == "app" and services["claude"]["api_key"]["source"] is None

@@ -1,5 +1,5 @@
 """Recognising a piece of clothing from a photo, and the stylist that puts outfits together from the dressing:
-the questions, tools and answers, and the Claude API calls."""
+the questions, tools and answers, and the Claude API calls. gpt.py asks the same through OpenAI (ChatGPT)."""
 
 import asyncio
 import base64
@@ -40,7 +40,7 @@ def _reason(e: anthropic.APIStatusError) -> str:
 
 
 def client(user: dict) -> anthropic.AsyncAnthropic:
-    key, source = keys.active_key(user)
+    key, source = keys.active_key(user, "claude")
     if source == "locked":
         raise ClaudeError("Je API-sleutel is vergrendeld op dit toestel. Log uit en opnieuw in om hem te ontgrendelen.")
     if not key:
@@ -104,6 +104,14 @@ async def _create(user: dict, **kwargs):
 
 
 async def _ask(user: dict, tool: dict, *, system: str, content: list, effort: str = "low") -> dict:
+    """Asks the AI service this account chose; the questions, tool and answers are the same for both."""
+    if keys.provider(user) == "openai":
+        from . import gpt
+        return await gpt.run_until_tool_call(user, tool, system=system, content=content, effort=effort)
+    return await _ask_claude(user, tool, system=system, content=content, effort=effort)
+
+
+async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, effort: str) -> dict:
     """Sends the question until Claude calls `tool`, then returns that call's input. Forced tool use isn't accepted by
     the current models, so the tool is offered and asked for by name."""
     name = model(user)

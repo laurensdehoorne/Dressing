@@ -376,7 +376,7 @@ function renderStylist() {
       <button class="btn-pill icon primary" aria-label="Vraag een outfit" ${st.loading ? "disabled" : ""}>${st.loading ? `<span class="spinner sm"></span>` : "↑"}</button></form>
     ${weatherLine()}`;
   if (!S.items.length) return `${top}<div class="empty"><p>Voeg eerst kleren toe aan je dressing; de stylist kiest enkel uit wat je hebt.</p></div>`;
-  if (!aiReady()) return `${top}<div class="notice">Stel een API-sleutel in bij Instellingen om outfits te laten voorstellen.</div>`;
+  if (!aiReady()) return `${top}<div class="notice">Stel een API-sleutel voor ${h(aiService().name)} in bij Instellingen om outfits te laten voorstellen.</div>`;
   if (st.loading) return `${top}<div class="analyzing"><div class="spinner"></div><p><b>${h(st.step || "Je stylist denkt na…")}</b></p><p class="muted small">Kijkt naar je dressing${st.useWeather && S.place ? ", het weer" : ""} en wat je laatst droeg.</p></div>`;
   if (st.error) return `${top}<div class="notice err">${h(st.error)}</div>${suggestions()}`;
   if (st.result) return `${top}${outfitsHTML(st.result)}<div class="buttons"><button class="btn-secondary" data-act="stylist-reset">Nieuwe vraag</button></div>`;
@@ -488,10 +488,13 @@ function renderAuth() {
 
 // MARK: - Settings tab
 
-const aiReady = () => ["app", "env"].includes(S.api_key?.source);
+/** The AI service this account uses (Claude or ChatGPT), with its key (only a hint) and model. */
+const aiProvider = () => S.ai?.provider || "claude";
+const aiService = (name = aiProvider()) => S.ai?.services?.[name] || { name: "Claude", api_key: {}, model: "" };
+const aiReady = () => ["app", "env"].includes(aiService().api_key?.source);
 
 function renderSettings() {
-  const user = ui.auth.user, key = S.api_key || {};
+  const user = ui.auth.user, service = aiService(), key = service.api_key || {};
   const keyText = key.source === "app" ? `Ingesteld (${h(key.hint)})` : key.source === "env" ? "Uit de serverinstellingen (.env)" : key.source === "locked" ? "Vergrendeld: log opnieuw in" : "Niet ingesteld";
   return `<h1 class="large">Instellingen</h1>
     <h2 class="section-title">Over jou</h2>
@@ -505,17 +508,21 @@ function renderSettings() {
       <div class="field"><label for="s-place">Woonplaats</label><input id="s-place" name="place" value="${h(S.place?.name || "")}" placeholder="bv. Kortrijk"></div>
       <div class="auth-submit"><button class="btn-primary">Bewaren</button></div></form>
     <p class="footnote">Het weer komt van Open-Meteo, zonder sleutel of account.</p>
-    <h2 class="section-title">AI (Claude van Anthropic)</h2>
+    <h2 class="section-title">AI-dienst</h2>
+    <div class="pills" role="group" aria-label="AI-dienst" style="margin-bottom:10px">
+      ${Object.entries(S.ai?.services || {}).map(([name, s]) => `<button data-act="set-provider" data-value="${name}" aria-pressed="${aiProvider() === name}">${h(s.name)}
+        <span class="n">${h(s.company)}${["app", "env"].includes(s.api_key?.source) ? " · ✓" : ""}</span></button>`).join("")}</div>
     <div class="card">
-      <div class="row"><span class="grow">API-sleutel</span><span class="v">${keyText}</span></div>
+      <div class="row"><span class="grow">API-sleutel voor ${h(service.name)}</span><span class="v">${keyText}</span></div>
       <form data-act-submit="save-key"><div class="field"><label for="s-key">${key.source === "app" ? "Andere sleutel" : "Sleutel"}</label>
-        <input id="s-key" name="key" type="password" autocomplete="off" placeholder="sk-ant-…" spellcheck="false"></div>
+        <input id="s-key" name="key" type="password" autocomplete="off" placeholder="${aiProvider() === "openai" ? "sk-proj-…" : "sk-ant-…"}" spellcheck="false"></div>
         <div class="auth-submit"><button class="btn-primary" ${ui.keyBusy ? "disabled" : ""}>${ui.keyBusy ? `<span class="spinner sm"></span>` : ""}Sleutel controleren en bewaren</button></div></form>
       ${key.source === "app" ? `<div class="row"><button class="row-button danger" data-act="clear-key">Sleutel verwijderen</button></div>` : ""}
-      <div class="row"><span class="grow">Model</span><span class="v">${h(S.model)}</span></div>
+      <div class="row"><span class="grow">Model</span><span class="v">${h(service.model)}</span></div>
       ${aiReady() ? `<div class="row"><button class="row-button" data-act="pick-model">Ander model kiezen</button></div>` : ""}
     </div>
-    <p class="footnote">Maak een sleutel op console.anthropic.com. Hij wordt versleuteld met je wachtwoord bewaard: niemand anders kan hem lezen.
+    <p class="footnote">Maak een sleutel op ${h(service.console || "console.anthropic.com")}. Je kan voor beide diensten een sleutel bewaren
+      en wisselen wanneer je wil; de herkenning en de stylist gebruiken de gekozen dienst. Een sleutel wordt versleuteld met je wachtwoord bewaard: niemand anders kan hem lezen.
       Een foto herkennen of een outfit vragen kost meestal minder dan een cent.</p>
     <h2 class="section-title">Account</h2>
     <div class="card">
@@ -708,18 +715,22 @@ const actions = {
     loadUsers();
   },
   async "clear-key"() {
-    if (!confirm("Je API-sleutel verwijderen?")) return;
-    await mutate(() => api("/api/settings/api-key", { method: "DELETE" }));
+    if (!confirm(`Je ${aiService().name}-sleutel verwijderen?`)) return;
+    await mutate(() => api(`/api/settings/api-key?provider=${aiProvider()}`, { method: "DELETE" }));
   },
   async "pick-model"() {
     let models;
-    try { models = await api("/api/settings/models"); } catch (e) { return toast(e.message); }
+    try { models = await api(`/api/settings/models?provider=${aiProvider()}`); } catch (e) { return toast(e.message); }
     openSheet(`<div class="topbar"><span class="spacer"></span><span class="title" id="sheet-title">Model</span><button class="btn-pill strong" data-act="close-sheet">Klaar</button></div>
-      <div class="card"><div class="row"><button class="row-button" data-act="set-model" data-value="">Standaard (${h(S.default_model)})</button></div>
-      ${models.map((m) => `<div class="row"><button class="row-button" data-act="set-model" data-value="${h(m.id)}">${h(m.name)}<span class="muted small" style="display:block">${h(m.id)}</span></button>${S.model === m.id ? "✓" : ""}</div>`).join("")}</div>
-      <p class="footnote">Enkel modellen die foto's kunnen lezen. Een groter model kiest wat fijner, maar kost meer.</p>`);
+      <div class="card"><div class="row"><button class="row-button" data-act="set-model" data-value="">Standaard (${h(aiService().default_model)})</button></div>
+      ${models.map((m) => `<div class="row"><button class="row-button" data-act="set-model" data-value="${h(m.id)}">${h(m.name)}<span class="muted small" style="display:block">${h(m.id)}</span></button>${aiService().model === m.id ? "✓" : ""}</div>`).join("")}</div>
+      <p class="footnote">${aiProvider() === "openai" ? "Kies een model dat foto's kan lezen." : "Enkel modellen die foto's kunnen lezen."} Een groter model kiest wat fijner, maar kost meer.</p>`);
   },
-  async "set-model"(el) { if (await mutate(() => api("/api/settings/model", { method: "PUT", json: { model: el.dataset.value || null } }))) closeSheet(); },
+  async "set-provider"(el) {
+    if (el.dataset.value === aiProvider()) return;
+    if (await mutate(() => api("/api/settings/provider", { method: "PUT", json: { provider: el.dataset.value } }))) toast(`${aiService().name} herkent en kiest nu je kleren`);
+  },
+  async "set-model"(el) { if (await mutate(() => api("/api/settings/model", { method: "PUT", json: { model: el.dataset.value || null, provider: aiProvider() } }))) closeSheet(); },
   async audit() {
     let list;
     try { list = await api("/api/audit"); } catch (e) { return toast(e.message); }
@@ -764,7 +775,7 @@ const submits = {
   },
   async "save-key"(form) {
     ui.keyBusy = true; render();
-    const ok = await mutate(() => api("/api/settings/api-key", { method: "PUT", json: { key: form.key.value } }));
+    const ok = await mutate(() => api("/api/settings/api-key", { method: "PUT", json: { key: form.key.value, provider: aiProvider() } }));
     ui.keyBusy = false; render();
     if (ok) toast("Sleutel bewaard");
   },

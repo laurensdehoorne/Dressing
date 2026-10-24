@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
-from . import audit, auth, claude, db, keys, weather
+from . import audit, auth, claude, db, gpt, keys, weather
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 BACKUPS_TO_KEEP = 14
@@ -43,12 +43,15 @@ Admin = Annotated[dict, Depends(auth.require_admin)]
 
 
 def require_ai_key(user: User) -> dict:
-    """For a request that asks the AI: checked first, so nothing is uploaded for an analysis that can't happen."""
-    key, source = keys.active_key(user)
+    """For a request that asks the AI: the service the account chose must have a key this sign-in can open. Checked
+    first, so nothing is uploaded for an analysis that can't happen."""
+    provider = keys.provider(user)
+    key, source = keys.active_key(user, provider)
+    name = keys.PROVIDERS[provider]["name"]
     if source == "locked":
-        raise HTTPException(409, "Je API-sleutel is vergrendeld op dit toestel. Log uit en opnieuw in om hem te ontgrendelen.")
+        raise HTTPException(409, f"Je {name}-sleutel is vergrendeld op dit toestel. Log uit en opnieuw in om hem te ontgrendelen.")
     if not key:
-        raise HTTPException(400, "Stel eerst een API-sleutel voor Claude in bij Instellingen: zonder sleutel kan de app geen "
+        raise HTTPException(400, f"Stel eerst een API-sleutel voor {name} in bij Instellingen: zonder sleutel kan de app geen "
                                  "kleren herkennen of outfits voorstellen.")
     return user
 
@@ -324,9 +327,31 @@ def _version() -> str:
 VERSION = _version()
 
 
-def _key_info(user: dict) -> dict:
-    key, source = keys.active_key(user)
+def _service(name: str):
+    """The module that talks to an AI service: claude (Anthropic) or gpt (OpenAI)."""
+    return {"claude": claude, "openai": gpt}[name]
+
+
+def _provider_name(provider: str | None, user: dict) -> str:
+    if not provider:
+        return keys.provider(user)
+    if provider not in keys.PROVIDERS:
+        raise HTTPException(400, "Onbekende AI-dienst.")
+    return provider
+
+
+def _key_info(user: dict, provider: str = "claude") -> dict:
+    key, source = keys.active_key(user, provider)
     return {"source": source, "hint": keys.hint(key) if source == "app" else ""}
+
+
+def _ai_info(user: dict) -> dict:
+    """Per service: its key (only a hint), its model and its default; plus which service is in use."""
+    services = {name: {"name": spec["name"], "company": spec["company"], "console": spec["console"],
+                       "api_key": _key_info(user, name), "model": _service(name).model(user),
+                       "default_model": _service(name).DEFAULT_MODEL}
+                for name, spec in keys.PROVIDERS.items()}
+    return {"provider": keys.provider(user), "services": services}
 
 
 @app.get("/api/state")
@@ -340,8 +365,7 @@ def state(user: User):
             "categories": [{"key": k, "label": v} for k, v in db.CATEGORIES.items()],
             "statuses": [{"key": k, "label": v} for k, v in db.STATUSES.items()],
             "seasons": db.SEASONS, "formality": db.FORMALITY, "warmth": db.WARMTH,
-            "model": claude.model(user), "default_model": claude.DEFAULT_MODEL,
-            "api_key": _key_info(user),
+            "ai": _ai_info(user),
             "place": settings.get("place"),
             "profile": settings.get("profile") or "",
             "version": VERSION,
@@ -350,45 +374,64 @@ def state(user: User):
 
 # MARK: - Settings: API key (write-only from the app: only a short hint ever comes back), model, profile, place
 
+class ProviderIn(BaseModel):
+    provider: str
+
+
+@app.put("/api/settings/provider")
+def set_provider(body: ProviderIn, user: User):
+    """Claude or ChatGPT for this account's recognition and stylist."""
+    auth.put_user_setting(user, "ai_provider", _provider_name(body.provider, user))
+    return _ai_info(user)
+
+
 class KeyIn(BaseModel):
     key: str
+    provider: str = "claude"
 
 
 @app.put("/api/settings/api-key")
 async def set_api_key(body: KeyIn, user: User):
-    key = body.key.strip()
-    if not key.startswith("sk-ant-"):
-        raise HTTPException(400, "Een Anthropic API-sleutel begint met sk-ant-.")
+    provider = _provider_name(body.provider, user)
+    key = "".join(body.key.split())  # drop spaces/newlines picked up while pasting
+    if provider == "claude" and (not key.startswith("sk-ant-") or len(key) < 30):
+        raise HTTPException(400, "Dit lijkt geen Anthropic API-sleutel (die begint met sk-ant-).")
+    if provider == "openai" and (not key.startswith("sk-") or key.startswith("sk-ant-") or len(key) < 30):
+        raise HTTPException(400, "Dit lijkt geen OpenAI API-sleutel (die begint met sk-, en niet met sk-ant-).")
     data_key = getattr(user, "data_key", None)
     if not data_key:
         raise HTTPException(409, "Log uit en opnieuw in om een sleutel te kunnen bewaren.")
-    await claude.check_key(key)
-    auth.put_user_setting(user, "api_key_enc", auth.encrypt_secret(data_key, key))
+    await _service(provider).check_key(key)  # only store a key the service accepts
+    auth.put_user_setting(user, keys.PROVIDERS[provider]["secret"], auth.encrypt_secret(data_key, key))
     return {"api_key": {"source": "app", "hint": keys.hint(key)}}
 
 
 @app.delete("/api/settings/api-key")
-def clear_api_key(user: User):
-    auth.put_user_setting(user, "api_key_enc", None)
-    return {"api_key": _key_info(user)}
+def clear_api_key(user: User, provider: str = "claude"):
+    provider = _provider_name(provider, user)
+    auth.put_user_setting(user, keys.PROVIDERS[provider]["secret"], None)
+    return {"api_key": _key_info(user, provider)}
 
 
 @app.get("/api/settings/models")
-async def list_models(user: User):
-    return await claude.list_models(user)
+async def list_models(user: User, provider: str = ""):
+    return await _service(_provider_name(provider, user)).list_models(user)
 
 
 class ModelIn(BaseModel):
     model: str | None = None
+    provider: str = ""
 
 
 @app.put("/api/settings/model")
 def set_model(body: ModelIn, user: User):
+    """This account's model for a service; empty goes back to the default (from .env or the built-in one)."""
+    provider = _provider_name(body.provider, user)
     chosen = (body.model or "").strip()
-    if chosen and not re.fullmatch(r"[a-z0-9.-]{3,80}", chosen):
+    if chosen and not re.fullmatch(r"[A-Za-z0-9._:-]{2,80}", chosen):
         raise HTTPException(400, "Onbekend model.")
-    auth.put_user_setting(user, "model", chosen or None)
-    return {"model": claude.model(user)}
+    auth.put_user_setting(user, keys.PROVIDERS[provider]["model_setting"], chosen or None)
+    return {"model": _service(provider).model(user)}
 
 
 class ProfileIn(BaseModel):
