@@ -1312,7 +1312,7 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ?", (user["id"],))]
         rejected = [db.rejected_row(r) for r in _rejected(conn, user, claude.REJECTED_SHOWN)]
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
-                                          style=settings.get("style_profile") or "", packed=packed, rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None)
+                                          style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None)
     return {**result, "weather": forecast, "elsewhere": elsewhere}
 
 

@@ -261,6 +261,7 @@ def test_suitcase_trip_and_stylist(client, monkeypatch):
     # An empty suitcase: the stylist helps to pack, from the whole dressing.
     r = client.post("/api/stylist", json={"query": "inpakken", "trip": True}, headers=H).json()
     assert "Winterjas" in seen[-1] and "nog inpakken" in seen[-1] and "18 tot 26 °C" in seen[-1]
+    assert "enkel het weer op mijn bestemming, niet het seizoen" in seen[-1] and "(herfst)" not in seen[-1]
     packed = client.put("/api/trip/items", json={"item_ids": [shirt["id"], "VAN-IEMAND-ANDERS"]}, headers=H).json()["trip"]
     assert packed["item_ids"] == [shirt["id"]]
     r = client.post("/api/stylist", json={"query": "stad", "trip": True}, headers=H).json()
@@ -724,3 +725,19 @@ def test_follow_up_adjusts_the_earlier_suggestion(client, monkeypatch):
     assert "Bijsturing: andere schoenen" in q and "Vraag:" not in q
     client.post("/api/stylist", json={"query": "etentje", "use_weather": False}, headers=H)
     assert "Vraag: etentje" in seen["question"] and "Eerder vroeg ik" not in seen["question"]
+
+
+def test_stylist_knows_the_season(client, monkeypatch):
+    from datetime import date
+    assert [claude.season(date(2026, m, 15)) for m in (1, 3, 6, 9, 11, 12)] == ["winter", "lente", "zomer", "herfst", "herfst", "winter"]
+    add(client, name="Linnen hemd", seasons=["zomer"])
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        seen["text"], seen["system"] = "\n".join(c["text"] for c in content), system
+        return {"advies": "", "outfits": []}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    assert f"Vandaag is het {date.today().isoformat()} ({claude.season(date.today())})." in seen["text"]
+    assert "seizoen zomer" in seen["text"] and "Het seizoen:" in seen["system"]
+    assert "niet het seizoen" not in seen["text"]  # at home the season counts

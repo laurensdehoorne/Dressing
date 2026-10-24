@@ -329,6 +329,13 @@ async def read_inspiration(user: dict, shots: list[tuple[bytes, tuple[int, int]]
 # MARK: - The stylist
 
 REJECTED_SHOWN = 25  # the latest turned-down outfits the stylist sees
+_SEASON_OF_MONTH = {12: "winter", 1: "winter", 2: "winter", 3: "lente", 4: "lente", 5: "lente",
+                    6: "zomer", 7: "zomer", 8: "zomer", 9: "herfst", 10: "herfst", 11: "herfst"}
+
+
+def season(day: date) -> str:
+    """The season of a day as people dress for it here: by month, December to February is winter."""
+    return _SEASON_OF_MONTH[day.month]
 
 def _rejected_line(r: dict, names: dict[str, str]) -> str:
     line = f"{r['at'][:10]}: " + " + ".join(names.get(i, "?") for i in r.get("item_ids", []))
@@ -366,11 +373,12 @@ def _item_line(item: dict, wear: dict) -> str:
 
 async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[dict], *, weather: str = "",
                           profile: str = "", style: str = "", packed: list[str] | None = None,
-                          weather_at: Callable[[dict], Awaitable[str]] | None = None, rejected: list[dict] = (),
+                          weather_at: Callable[[dict], Awaitable[str]] | None = None, trip: bool = False, rejected: list[dict] = (),
                           previous: dict | None = None) -> dict:
     """1 to 3 outfits from the pieces in the dressing for this question (an occasion, the weather, a mood); on a trip
     (packed: what is in the suitcase) only from the suitcase. style: the profile the AI wrote from outfits the user
-    likes (Inspiratie). rejected: outfits the user turned down, and why. previous: for a follow-up ("andere schoenen"),
+    likes (Inspiratie). trip: on a trip (also while packing), where only the destination's weather counts, not the
+    season. rejected: outfits the user turned down, and why. previous: for a follow-up ("andere schoenen"),
     what was asked before and what was suggested, to adjust rather than start over. With weather_at the stylist can look up the weather of
     another place or a later day the question is about (an outing to Amsterdam, Saturday)."""
     wear: dict[str, dict] = {}
@@ -410,9 +418,11 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         wardrobe += "\n\nWat ik eerder droeg en hoe het viel:\n" + "\n".join(taste)
     if refused := [_rejected_line(r, names) for r in rejected[:REJECTED_SHOWN]]:
         wardrobe += "\n\nOutfits die je voorstelde en die ik afwees, met waarom:\n" + "\n".join(refused)
-    question = f"Vandaag is het {date.today().isoformat()}."
+    question = f"Vandaag is het {date.today().isoformat()}." if trip else f"Vandaag is het {date.today().isoformat()} ({season(date.today())})."
     if weather:
         question += f"\n{weather}"
+    if trip:
+        question += "\nOp reis telt enkel het weer op mijn bestemming, niet het seizoen."
     helpers: Helpers = {WEATHER_TOOL["name"]: (WEATHER_TOOL, weather_at)} if weather_at else {}
     if helpers:
         question += ("\nGaat de vraag over een andere plaats dan hierboven (een uitstap, een reis, een feest elders) of over "
@@ -560,6 +570,7 @@ Een outfit is compleet en draagbaar:
 - Nooit twee stukken die hetzelfde doen (twee broeken, twee paar schoenen).
 
 Kies zoals een stylist dat doet:
+- Het seizoen: kies stukken voor het seizoen van het moment waarover de vraag gaat (het staat bij de datum). Een stuk met andere seizoenen enkel als het weer er echt om vraagt (een warme dag in de herfst, een koude in de lente), en dan zo dat het outfit toch bij het seizoen past: in de herfst en winter donkerdere en warmere tinten en stoffen, in de lente en zomer lichtere. Een stuk zonder seizoenen kan het hele jaar. Op reis telt het seizoen niet: daar kies je enkel naar het weer ter plaatse (een zomerjurk voor de Canarische Eilanden in december).
 - Het weer eerst: kijk naar de gevoelstemperatuur, regen en wind van het moment waarover de vraag gaat (vandaag, morgen, 's avonds). Onder 10 °C een warme laag en jas, boven 22 °C lichte stoffen; bij regen geen suède en een jas die ertegen kan. Gebruik de warmte (1-5) van elk stuk en laag op als het 's ochtends fris en 's middags warm is.
 - De gelegenheid bepaalt hoe formeel (1-5): een sollicitatie of huwelijk vraagt meer dan een terrasje. Liever een tikje te verzorgd dan te slordig.
 - Kleuren die samengaan: neutrale basis (marine, grijs, beige, zwart, wit, ecru) met hoogstens één of twee accentkleuren; patronen hoogstens één opvallend stuk, tenzij ze bewust combineren. Materialen en stijl in dezelfde lijn.
