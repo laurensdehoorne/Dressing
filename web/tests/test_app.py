@@ -616,3 +616,59 @@ def test_style_profile_rewritten_and_edited(client, monkeypatch):
     assert r.json()["style_profile"] == "Zwart, sportief-chic." and "Geen nieuwe foto's" in seen["text"]
     r = client.put("/api/settings/style-profile", json={"profile": " Liever geen zwart. "}, headers=H)
     assert r.json()["style_profile"] == "Liever geen zwart."
+
+
+def test_board_link_gives_its_feed():
+    assert main._board_feed("https://nl.pinterest.com/laurens/outfits/") == "https://nl.pinterest.com/laurens/outfits.rss"
+    assert main._board_feed("https://www.pinterest.co.uk/laurens/zomer-looks") == "https://www.pinterest.co.uk/laurens/zomer-looks.rss"
+    assert main._board_feed("https://www.pinterest.com/pin/12345/") is None  # a pin, not a board
+    assert main._board_feed("https://www.pinterest.com/laurens/") is None  # a profile
+    assert main._board_feed("https://evil.example/laurens/outfits") is None
+
+
+def test_board_pins_from_its_feed(monkeypatch):
+    feed = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>Outfits</title>
+      <item><link>https://www.pinterest.com/pin/1/</link><description>&lt;a href="/pin/1/"&gt;&lt;img src="https://i.pinimg.com/236x/aa/a.jpg"&gt;&lt;/a&gt;Linnen</description></item>
+      <item><link>https://www.pinterest.com/pin/2/</link><description>Geen foto</description></item>
+    </channel></rss>"""
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+    monkeypatch.setattr(main, "_public_host", lambda url: True)
+    monkeypatch.setattr(main._opener, "open", lambda req, timeout: Resp(feed))
+    assert main._board_pins("https://www.pinterest.com/laurens/outfits.rss") == [("https://www.pinterest.com/pin/1/", "https://i.pinimg.com/236x/aa/a.jpg")]
+    asked = []
+    monkeypatch.setattr(main, "_fetch_photo", lambda url: asked.append(url) or (b"jpeg" if "236x" in url else None))
+    assert main._pin_photo("https://i.pinimg.com/236x/aa/a.jpg") == b"jpeg"  # the larger one first, else the feed's
+    assert asked == ["https://i.pinimg.com/736x/aa/a.jpg", "https://i.pinimg.com/236x/aa/a.jpg"]
+
+
+def test_import_a_board_in_batches_without_pins_already_there(client, monkeypatch):
+    pins = [(f"https://www.pinterest.com/pin/{n}/", f"https://i.pinimg.com/236x/{n}.jpg") for n in range(8)]
+    monkeypatch.setattr(main, "_board_pins", lambda feed: pins if feed == "https://www.pinterest.com/laurens/outfits.rss" else [])
+    monkeypatch.setattr(main, "_pin_photo", lambda picture: None if "/3.jpg" in picture else jpeg())
+    batches = []
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        n = sum(c["type"] == "image" for c in content)
+        batches.append(n)
+        return {"looks": [{"foto": i, "beschrijving": f"Look {len(batches)}.{i}"} for i in range(1, n + 1)],
+                "profiel": f"Profiel na {len(batches)} keer."}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    r = client.post("/api/inspiration", data={"url": "https://www.pinterest.com/laurens/outfits/"}, headers=H)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert batches == [5, 2]  # 6 and 2 pins, one without a picture
+    assert len(body["added"]) == 7 and body["skipped"] == 1 and body["known"] == 0 and body["style_profile"] == "Profiel na 2 keer."
+    assert {l["url"] for l in body["added"]} == {p for p, _ in pins} - {"https://www.pinterest.com/pin/3/"}
+
+    # Again: only what is new on the board.
+    pins.insert(0, ("https://www.pinterest.com/pin/new/", "https://i.pinimg.com/236x/new.jpg"))
+    body = client.post("/api/inspiration", data={"url": "https://www.pinterest.com/laurens/outfits"}, headers=H).json()
+    assert batches[-1] == 1 and body["known"] == 7 and [l["url"] for l in body["added"]] == ["https://www.pinterest.com/pin/new/"]
+
+    r = client.post("/api/inspiration", data={"url": "https://www.pinterest.com/laurens/geheim"}, headers=H)
+    assert r.status_code == 400 and "geheim" in r.json()["detail"]

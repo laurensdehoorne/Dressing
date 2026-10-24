@@ -674,12 +674,12 @@ function renderInspiration(page) {
   const bar = `<div class="topbar"><button class="btn-plain" data-act="back">‹ Terug</button><span class="title">Inspiratie</span><span class="spacer"></span></div>`;
   const list = looks(), ready = aiReady();
   const adding = page.phase === "reading" ? `<div class="analyzing"><div class="spinner"></div><p><b>${h(page.step || "De AI bekijkt je outfits…")}</b></p>
-      <p class="muted small">Kleuren, silhouet en sfeer, en wat dat zegt over je stijl.</p></div>`
+      <p class="muted small">Kleuren, silhouet en sfeer, en wat dat zegt over je stijl. Een heel bord duurt een paar minuten.</p></div>`
     : `<div class="buttons" style="margin-top:0"><label class="btn-primary${ready ? "" : " disabled"}">📱 Screenshots kiezen
         <input class="file-input" type="file" accept="image/*" multiple data-act-change="inspiration-shots" ${ready ? "" : "disabled"}></label></div>
-      <form class="card" style="margin-top:12px" data-act-submit="inspiration-link"><div class="field"><label for="i-url">Of plak de link van een pin</label>
-        <input id="i-url" name="url" type="url" inputmode="url" autocapitalize="off" spellcheck="false" placeholder="https://pin.it/…" value="${h(page.url || "")}" required></div>
-        <div class="auth-submit"><button class="btn-secondary" ${ready ? "" : "disabled"}>Foto ophalen</button></div></form>`;
+      <form class="card" style="margin-top:12px" data-act-submit="inspiration-link"><div class="field"><label for="i-url">Of plak de link van een pin of een heel bord</label>
+        <input id="i-url" name="url" type="url" inputmode="url" autocapitalize="off" spellcheck="false" placeholder="https://pinterest.com/jouwnaam/outfits" value="${h(page.url || "")}" required></div>
+        <div class="auth-submit"><button class="btn-secondary" ${ready ? "" : "disabled"}>Ophalen</button></div></form>`;
   const style = page.editing ? `<form class="card" data-act-submit="save-style"><div class="field"><label for="i-style">Je stijl</label>
         <textarea id="i-style" name="profile" rows="6">${h(S.style_profile)}</textarea></div>
         <div class="auth-submit"><button class="btn-primary">Bewaren</button></div></form>
@@ -697,7 +697,8 @@ function renderInspiration(page) {
     <p class="footnote">Gaat mee naar de stylist bij elke vraag, naast wat je bij Over jou schreef. Tik een outfit aan om het na te maken met je eigen kleren.</p>
     ${list.length ? `<h2 class="section-title">${plural(list.length, "outfit", "outfits")}</h2><div class="grid">${list.map(lookTile).join("")}</div>` : ""}
     <p class="footnote">Instagram: neem een screenshot van de post (tot 6 tegelijk); de AI knipt het outfit eruit. Pinterest: een screenshot,
-      of Delen → Link kopiëren en hier plakken.</p>`;
+      of Delen → Link kopiëren en hier plakken, van een pin of van een heel bord. Van een bord komen de nieuwste pins (meestal tot 25)
+      die er nog niet in staan; het bord moet openbaar zijn. Importeer later opnieuw voor wat er bijkwam.</p>`;
 }
 
 function openLook(id) {
@@ -722,9 +723,13 @@ async function addInspiration(page, shots = null, url = "") {
   try {
     const r = await slowApi("/api/inspiration", { method: "POST", form },
       (p) => { if (p.step && p.step !== page.step) { page.step = p.step; if (stack.at(-1) === page) render(); } });
-    if (!r.added.length) throw new Error(shots?.length > 1 ? "Op deze foto's zag de AI geen outfit." : "Op deze foto zag de AI geen outfit.");
+    const board = r.pins !== undefined;
+    if (board && !r.added.length && !r.skipped) throw new Error(`Alle ${plural(r.pins, "pin", "pins")} van dit bord staan al in Inspiratie.`);
+    if (!r.added.length) throw new Error(board ? "Op de nieuwe pins van dit bord zag de AI geen outfit."
+      : shots?.length > 1 ? "Op deze foto's zag de AI geen outfit." : "Op deze foto zag de AI geen outfit.");
     page.url = "";
-    page.note = `${plural(r.added.length, "outfit", "outfits")} bewaard${r.skipped ? ` (op ${plural(r.skipped, "foto", "foto's")} stond geen outfit)` : ""}. Je stijl is bijgewerkt.`;
+    page.note = [`${plural(r.added.length, "outfit", "outfits")} bewaard`, r.skipped && `${plural(r.skipped, board ? "pin" : "foto", board ? "pins" : "foto's")} zonder outfit overgeslagen`,
+      r.known && `${plural(r.known, "pin stond", "pins stonden")} er al in`].filter(Boolean).join(", ") + ". Je stijl is bijgewerkt.";
     await load();
   } catch (e) { page.error = e.message; }
   page.phase = "idle";

@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -944,10 +945,90 @@ def _look_texts(user: dict) -> list[str]:
         return [json.loads(r["data"]).get("description", "") for r in _inspiration(conn, user)]
 
 
+BOARD_PINS = 50  # the most pins one import takes; a board's feed holds about the latest 25
+NOT_A_BOARD = {"pin", "search", "ideas", "today", "settings", "business", "_", "categories", "explore"}
+
+
+def _pinterest(host: str) -> bool:
+    return bool(re.fullmatch(r"([a-z]{2,3}\.)?(www\.)?pinterest(\.[a-z]{2,3}){1,2}", host or ""))
+
+
+def _resolve(url: str) -> str:
+    """Where a short link (pin.it) leads; any other link as it is."""
+    if urllib.parse.urlsplit(url).hostname != "pin.it" or not _public_host(url):
+        return url
+    try:
+        with _opener.open(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Dressing)"}), timeout=10) as resp:
+            return resp.geturl()
+    except (OSError, ValueError):
+        return url
+
+
+def _board_feed(url: str) -> str | None:
+    """The RSS feed of a Pinterest board (pinterest.com/<name>/<board>/), or None when the link isn't to a board."""
+    parts = urllib.parse.urlsplit(url)
+    path = [p for p in parts.path.split("/") if p]
+    if not _pinterest(parts.hostname or "") or len(path) != 2 or path[0] in NOT_A_BOARD or path[1].endswith(".rss"):
+        return None
+    return f"https://{parts.hostname}/{path[0]}/{path[1]}.rss"
+
+
+def _board_pins(feed: str) -> list[tuple[str, str]]:
+    """The pins on a public board, newest first: (link to the pin, its picture in the feed)."""
+    if not _public_host(feed):
+        return []
+    req = urllib.request.Request(feed, headers={"User-Agent": "Mozilla/5.0 (compatible; Dressing)", "Accept": "application/rss+xml, text/xml"})
+    try:
+        with _opener.open(req, timeout=15) as resp:
+            root = ET.fromstring(resp.read(PAGE_BYTES))
+    except (OSError, ValueError, ET.ParseError):
+        return []
+    pins = []
+    for item in root.iter("item"):
+        link = (item.findtext("link") or "").strip()
+        found = re.search(r"""<img[^>]+src=["']([^"']+)["']""", item.findtext("description") or "")
+        if link.startswith("https://") and found:
+            pins.append((link, html.unescape(found.group(1))))
+    return pins[:BOARD_PINS]
+
+
+def _pin_photo(picture: str) -> bytes | None:
+    """A pin's picture: the feed shows a small one (236x), the same is there larger (736x)."""
+    larger = re.sub(r"/\d+x/", "/736x/", picture, count=1)
+    return (_fetch_photo(larger) if larger != picture else None) or _fetch_photo(picture)
+
+
+async def _import_board(user: dict, feed: str):
+    """Every pin on the board that isn't in Inspiratie yet, 6 at a time to the AI; the profile grows with each batch."""
+    claude.report(step="Bord ophalen")
+    pins = await asyncio.to_thread(_board_pins, feed)
+    if not pins:
+        raise HTTPException(400, "Dit bord vond ik niet, of het is geheim. Zet het openbaar op Pinterest, of gebruik screenshots.")
+    with db.connect() as conn:
+        known = {json.loads(r["data"]).get("url") for r in _inspiration(conn, user)}
+    new = [pin for pin in pins if pin[0] not in known]
+    result = {"added": [], "skipped": 0, "known": len(pins) - len(new), "pins": len(pins)}
+    for start in range(0, len(new), MAX_SHOTS):
+        batch = new[start:start + MAX_SHOTS]
+        claude.report(step=f"Pins {start + 1}–{start + len(batch)} van {len(new)} ophalen")
+        photos = await asyncio.gather(*(asyncio.to_thread(_pin_photo, picture) for _, picture in batch))
+        got = [(link, photo) for (link, _), photo in zip(batch, photos) if photo]
+        result["skipped"] += len(batch) - len(got)
+        if not got:
+            continue
+        claude.report(step=f"Pins {start + 1}–{start + len(batch)} van {len(new)} bekijken")
+        originals = await asyncio.to_thread(lambda: [Image.open(io.BytesIO(photo)) for _, photo in got])
+        done = await _read_inspiration(user, originals, [link for link, _ in got])
+        result["added"] += done["added"]
+        result["skipped"] += done["skipped"]
+    result["style_profile"] = auth.user_settings(user).get("style_profile") or ""
+    return result
+
+
 @app.post("/api/inspiration")
 async def add_inspiration(user: AIUser, request: Request, shots: list[UploadFile] = File(None), url: str = Form("")):
-    """Screenshots of outfits (Instagram, Pinterest), or a link to a pin: the AI describes each outfit, cuts it out of
-    the screenshot and writes the style profile anew."""
+    """Screenshots of outfits (Instagram, Pinterest), a link to a pin, or a link to a public Pinterest board: the AI
+    describes each outfit, cuts it out of a screenshot and writes the style profile anew."""
     raws = [await shot.read() for shot in shots or []]
     url = url.strip()[:2000]
     if len(raws) > MAX_SHOTS:
@@ -957,6 +1038,8 @@ async def add_inspiration(user: AIUser, request: Request, shots: list[UploadFile
     if not raws and not url.startswith(("https://", "http://")):
         raise HTTPException(400, "Dit lijkt geen link. Kopieer de link van de pin (Delen → Link kopiëren).")
     url = re.sub(r"^http://", "https://", url)
+    if not raws and (feed := _board_feed(await asyncio.to_thread(_resolve, url))):
+        return await _background(request, user, _analysis(user, "inspiratie", _import_board(user, feed)))
 
     async def work():
         found = raws
@@ -966,22 +1049,23 @@ async def add_inspiration(user: AIUser, request: Request, shots: list[UploadFile
                 raise HTTPException(400, "Op deze link vond ik geen foto. Bij Instagram lukt dat meestal niet: neem dan een screenshot.")
             found = [photo]
         originals = await asyncio.to_thread(lambda: [Image.open(io.BytesIO(_jpeg(raw, 3000, 90))) for raw in found])
-        return await _read_inspiration(user, originals, url if not raws else "")
+        return await _read_inspiration(user, originals, [url if not raws else ""] * len(originals))
     return await _background(request, user, _analysis(user, "inspiratie", work()))
 
 
-async def _read_inspiration(user: dict, originals: list[Image.Image], url: str):
+async def _read_inspiration(user: dict, originals: list[Image.Image], urls: list[str]):
     sent = await asyncio.to_thread(_shots_to_send, originals)
     profile = auth.user_settings(user).get("style_profile") or ""
     found = await claude.read_inspiration(user, sent, await asyncio.to_thread(_look_texts, user), profile)
-    added = await asyncio.to_thread(_keep_looks, user, found["looks"], originals, sent, url)
+    added = await asyncio.to_thread(_keep_looks, user, found["looks"], originals, sent, urls)
     if added and found["profile"]:
         auth.put_user_setting(user, "style_profile", found["profile"])
     return {"added": added, "skipped": len(originals) - len(added), "style_profile": auth.user_settings(user).get("style_profile") or ""}
 
 
-def _keep_looks(user: dict, looks: list[dict], originals: list[Image.Image], sent: list, url: str) -> list[dict]:
-    """Each outfit with its photo: cut out of the screenshot where the AI says it is, else the whole picture."""
+def _keep_looks(user: dict, looks: list[dict], originals: list[Image.Image], sent: list, urls: list[str]) -> list[dict]:
+    """Each outfit with its photo: cut out of the screenshot where the AI says it is, else the whole picture; with the
+    link to the pin it came from (urls: one per picture, empty for a screenshot)."""
     added, used = [], set()
     for look in looks:
         n = look["photo"]
@@ -997,8 +1081,8 @@ def _keep_looks(user: dict, looks: list[dict], originals: list[Image.Image], sen
         look_id = db.new_id()
         (db.PHOTO_DIR / f"{look_id}.jpg").write_bytes(jpeg)
         data = {k: look[k] for k in ("description", "colors", "style_tags", "pieces")}
-        if url:
-            data["url"] = url
+        if urls[n - 1]:
+            data["url"] = urls[n - 1]
         with db.connect() as conn:
             conn.execute("INSERT INTO inspiration (id, user_id, added_at, data) VALUES (?, ?, ?, ?)",
                          (look_id, user["id"], db.now_iso(), json.dumps(data)))
