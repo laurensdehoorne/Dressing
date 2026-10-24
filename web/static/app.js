@@ -651,6 +651,7 @@ function outfitsHTML(r) {
       <div class="head"><span class="n">Outfit ${n + 1}</span><h2>${h(o.title)}</h2></div>
       <div class="pieces">${o.item_ids.map(piece).join("")}</div>
       <p class="why">${h(o.reason)}</p>${o.tip ? `<p class="tip">💡 ${h(o.tip)}</p>` : ""}
+      ${pictureHTML(o, n)}
       ${o.rejected ? `<div class="notice turned-down"><span class="grow">👎 Afgekeurd: ${h(rejectWhy(o.rejected))}</span><button data-act="undo-reject" data-n="${n}">Ongedaan maken</button></div>`
         : `<div class="foot"><button class="btn-secondary narrow" data-act="reject-outfit" data-n="${n}" aria-label="Niet goed">👎</button>
         ${r.trip && o.item_ids.some((id) => !packed(id)) ? `<button class="btn-secondary" data-act="pack-outfit" data-n="${n}">🧳 In de valies</button>` : ""}
@@ -658,6 +659,16 @@ function outfitsHTML(r) {
     ${!r.outfits.length ? `<div class="notice">Geen outfit gevonden die past.</div>` : ""}
     ${r.missing ? `<div class="notice">🛍️ ${h(r.missing)}</div>` : ""}
     ${r.analysis ? `<p class="footnote" style="text-align:center">Dit antwoord kostte ${r.analysis.status === "estimated" ? "ongeveer" : "minstens"} ${euros(r.analysis.cost_eur)}.</p>` : ""}`;
+}
+
+/** The picture of an outfit, only made when asked with its button (ChatGPT draws it from the photos of the pieces). */
+function pictureHTML(o, n) {
+  if (o.picture) return `<img class="outfit-picture" src="${h(o.picture)}" alt="Beeld van ${h(o.title)}">
+    <p class="footnote">Getekend door ${h(S.ai?.image_model || "ChatGPT")} naar de foto's van je stukken: het kan afwijken van hoe ze echt zijn.${o.pictureCost ? ` Dit beeld kostte ${o.pictureCost.status === "estimated" ? "ongeveer" : "minstens"} ${euros(o.pictureCost.cost_eur)}.` : ""}</p>`;
+  if (o.drawing) return `<p class="footnote"><span class="spinner sm"></span> Beeld tekenen…</p>`;
+  if (!S.ai?.can_draw) return "";
+  return `${o.drawError ? `<div class="notice err">${h(o.drawError)}</div>` : ""}
+    <button class="btn-plain draw-outfit" data-act="draw-outfit" data-n="${n}">🖼️ Toon als beeld</button>`;
 }
 
 /** A question for the stylist; with followUp, an adjustment of the answer that is shown (it sees that answer). */
@@ -930,6 +941,9 @@ function renderSettings() {
       ${[["standaard", "Standaard"], ["zuinig", "Zuinig"]].map(([q, label]) => `<button data-act="set-quality" data-value="${q}" aria-pressed="${(S.ai?.quality || "standaard") === q}">${label}</button>`).join("")}</div>
     <p class="footnote">${S.ai?.quality === "zuinig" ? `Zuinig: een foto herkennen en een bestelling lezen doet het goedkope ${h(service.helper_model)}; de stylist blijft op ${h(service.model)}.`
       : `Standaard: alles met ${h(service.model)}. Zuinig laat een foto herkennen en een bestelling lezen over aan het goedkopere ${h(service.helper_model)}.`}</p>
+    ${aiProvider() === "openai" && S.ai?.quality !== "zuinig" && service.model === service.default_model ? `<p class="footnote">Bij ChatGPT kiest de stylist zelf:
+      ${h(service.model)} voor gewone vragen, ${h(S.ai.complex_model)} voor een dresscode of een look om na te maken, en ${h(S.ai.review_model)}
+      als een antwoord niet door de controle raakt. Kies je zelf een model of Zuinig, dan doet dat model alles.</p>` : ""}
     <p class="footnote">Maak een sleutel op ${h(service.console || "console.anthropic.com")}. Je kan voor beide diensten een sleutel bewaren
       en wisselen wanneer je wil; de herkenning en de stylist gebruiken de gekozen dienst. Een sleutel wordt versleuteld met je wachtwoord bewaard: niemand anders kan hem lezen.
       Een foto herkennen of een outfit vragen kost meestal minder dan een cent.</p>
@@ -1250,6 +1264,20 @@ const actions = {
   "rewrite-style": () => rewriteStyle(stack.at(-1)),
   "stylist-reset": () => { Object.assign(ui.stylist, { query: "", result: null, error: null, thread: [], refine: "" }); render(); },
   "refine-suggest": (el) => askStylist(el.dataset.q, true),
+  async "draw-outfit"(el) {
+    const o = ui.stylist.result?.outfits[Number(el.dataset.n)];
+    if (!o || o.drawing) return;
+    Object.assign(o, { drawing: true, drawError: null });
+    render();
+    try {
+      const r = await slowApi("/api/outfit-picture", { method: "POST", json: { item_ids: o.item_ids } });
+      Object.assign(o, { picture: r.image, pictureCost: r.analysis || null });
+    } catch (e) {
+      o.drawError = e.message;
+    }
+    o.drawing = false;
+    if (ui.tab === "stylist") render();
+  },
   "reject-outfit": (el) => { ui.reject = { n: Number(el.dataset.n), reasons: [], note: "", requestId: requestId() }; openRejectSheet(); },
   "toggle-reason": (el) => { const rj = ui.reject, v = el.dataset.value; rj.reasons = rj.reasons.includes(v) ? rj.reasons.filter((x) => x !== v) : [...rj.reasons, v]; openRejectSheet(); },
   "save-reject": () => saveReject(),

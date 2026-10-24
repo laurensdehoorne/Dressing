@@ -48,6 +48,11 @@ PRICES = {
     # OpenAI's pricing page (developers.openai.com/api/docs/pricing), Standard tier, checked October 2026. Above 272K
     # input tokens a whole request costs 2x the input and cache prices and 1.5x the output price.
     "openai": {
+        "gpt-6-astra": {"input": 10.0, "cached": 1.0, "cache_write": 12.50, "output": 50.0,
+                        "long_context": {"above": 272_000, "input": 2.0, "output": 1.5}},
+        # An image model: text and photos in at their own price, the picture out. Cached input only counts in the
+        # Responses API, which the app doesn't use for pictures.
+        "gpt-image-2.5-flare": {"input": 5.0, "image_input": 8.0, "output": 30.0},
         "gpt-6-luna": {"input": 0.10, "cached": 0.01, "cache_write": 0.125, "output": 0.50,
                        "long_context": {"above": 272_000, "input": 2.0, "output": 1.5}},
         "gpt-6.1-sol": {"input": 2.0, "cached": 0.10, "cache_write": 2.50, "output": 10.0,
@@ -232,6 +237,37 @@ def track_openai(requested: str, response) -> None:
                            getattr(response, "service_tier", None)))
     except Exception as e:
         print(f"cost of an OpenAI call: {e!r}")
+        record(Call("openai", requested, status="unknown", missing=["kost kon niet berekend worden"]))
+
+
+def from_openai_image(model: str, usage) -> Call:
+    """The Images API's usage: input_tokens split in text_tokens and image_tokens (the photos sent along), each at its
+    own price; output_tokens is the picture."""
+    call = Call("openai", model)
+    inp, out = _count(usage, "input_tokens"), _count(usage, "output_tokens")
+    p = price("openai", model)
+    if inp is None or out is None:
+        call.status, call.missing = "unknown", ["tokengebruik"]
+        return call
+    call.input_tokens, call.output_tokens = inp, out
+    if p is None:
+        call.status, call.missing = "unknown", ["prijs van het model"]
+        return call
+    details = _get(usage, "input_tokens_details")
+    images = _count(details, "image_tokens")
+    if images is None:
+        _flag(call, "fototokens niet gerapporteerd: alles als tekst geteld")
+        images = 0
+    text = max(inp - images, 0)
+    call.cost_usd = (text * p["input"] + images * p.get("image_input", p["input"]) + out * p["output"]) / 1_000_000
+    return call
+
+
+def track_openai_image(requested: str, response) -> None:
+    try:
+        record(from_openai_image(requested, getattr(response, "usage", None)))
+    except Exception as e:
+        print(f"cost of an OpenAI picture: {e!r}")
         record(Call("openai", requested, status="unknown", missing=["kost kon niet berekend worden"]))
 
 

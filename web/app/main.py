@@ -362,7 +362,9 @@ def _ai_info(user: dict) -> dict:
                        "api_key": _key_info(user, name), "model": _service(name).model(user),
                        "default_model": _service(name).DEFAULT_MODEL, "helper_model": _service(name).HELPER_MODEL}
                 for name, spec in keys.PROVIDERS.items()}
-    return {"provider": keys.provider(user), "services": services, "quality": claude.quality(user)}
+    return {"provider": keys.provider(user), "services": services, "quality": claude.quality(user),
+            "can_draw": keys.active_key(user, "openai")[0] is not None, "image_model": gpt.IMAGE_MODEL,
+            "complex_model": gpt.COMPLEX_MODEL, "review_model": gpt.REVIEW_MODEL}
 
 
 @app.get("/api/state")
@@ -1314,6 +1316,43 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
                                           style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None)
     return {**result, "weather": forecast, "elsewhere": elsewhere}
+
+
+class PictureIn(BaseModel):
+    item_ids: list[str]
+
+
+@app.post("/api/outfit-picture")
+async def outfit_picture(body: PictureIn, user: User, request: Request):
+    """A picture of someone wearing these pieces, drawn by ChatGPT from their photos. Only this account's pieces, and
+    only when asked for one outfit with its button: never by itself."""
+    ids = list(dict.fromkeys(i for i in body.item_ids if isinstance(i, str) and SAFE_ID.fullmatch(i)))[:12]
+    if not ids:
+        raise HTTPException(400, "Kies de stukken van het outfit.")
+    with db.connect() as conn:
+        rows = {r["id"]: db.item_row(r) for r in conn.execute(
+            f"SELECT * FROM items WHERE user_id = ? AND id IN ({', '.join('?' * len(ids))})", (user["id"], *ids))}
+    if len(rows) != len(ids):
+        raise HTTPException(404, "Een van deze stukken staat niet (meer) in je dressing.")
+    return await _background(request, user, _analysis(user, "outfitbeeld", _draw(user, [rows[i] for i in ids])))
+
+
+def _piece_text(item: dict) -> str:
+    parts = [item.get("name") or item.get("kind") or db.CATEGORIES.get(item.get("category"), "stuk")]
+    if item.get("colors"):
+        parts.append("/".join(item["colors"]))
+    parts += [item[k] for k in ("pattern", "material", "fit") if item.get(k)]
+    return ", ".join(str(p) for p in parts)
+
+
+async def _draw(user: dict, items: list[dict]):
+    def photo(item: dict) -> bytes | None:
+        file = db.PHOTO_DIR / f"{item['id']}.jpg"
+        return file.read_bytes() if item.get("photo") and file.exists() else None
+    pieces = [(_piece_text(i), await asyncio.to_thread(photo, i)) for i in items]
+    claude.report(step="Beeld tekenen")
+    jpeg = await gpt.draw_outfit(user, pieces)
+    return {"image": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}
 
 
 # MARK: - Notifications ("Hoe viel je outfit?")

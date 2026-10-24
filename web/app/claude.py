@@ -130,12 +130,13 @@ async def run_helper(helpers: Helpers, name: str, given) -> str:
 
 
 async def _ask(user: dict, tool: dict, *, system: str, content: list, effort: str = "low", helpers: Helpers | None = None,
-               helper: bool = False) -> dict:
+               helper: bool = False, tier: str = "") -> dict:
     """Asks the AI service this account chose; the questions, tool and answers are the same for both. With `helper`,
-    its cheap helper model instead of the account's model."""
+    its cheap helper model instead of the account's model; with `tier` ("complex", "review"), ChatGPT's stronger model
+    for that kind of work (Claude keeps the account's model)."""
     if keys.provider(user) == "openai":
         from . import gpt
-        name, provider, asking = (gpt.HELPER_MODEL if helper else gpt.model(user)), "openai", gpt.run_until_tool_call
+        name, provider, asking = (gpt.HELPER_MODEL if helper else gpt.model_for(user, tier)), "openai", gpt.run_until_tool_call
     else:
         name, provider, asking = (HELPER_MODEL if helper else model(user)), "anthropic", _ask_claude
     try:
@@ -337,6 +338,20 @@ def season(day: date) -> str:
     """The season of a day as people dress for it here: by month, December to February is winter."""
     return _SEASON_OF_MONTH[day.month]
 
+
+# Questions that ask more of a stylist than an everyday outfit: a dress code, an occasion with expectations, or a look
+# to recreate. They go to the stronger model (gpt.COMPLEX_MODEL).
+DEMANDING = ("dresscode", "dress code", "black tie", "white tie", "cocktail", "gala", "huwelijk", "trouw", "bruiloft",
+             "sollicitatie", "sollicitere", "begrafenis", "uitvaart", "receptie", "communie", "doopfeest", "lentefeest",
+             "smart casual", "business", "zakelijk", "presentatie", "vergadering met", "klant", "opera", "theater",
+             "maak deze look na", "chiquer")
+
+
+def demanding(query: str, previous: dict | None = None) -> bool:
+    """Whether this question (or the one it adjusts) is about a dress code or a look to recreate."""
+    asked = " ".join([query, *((previous or {}).get("queries") or [])]).lower()
+    return any(word in asked for word in DEMANDING)
+
 def _rejected_line(r: dict, names: dict[str, str]) -> str:
     line = f"{r['at'][:10]}: " + " + ".join(names.get(i, "?") for i in r.get("item_ids", []))
     if r.get("query"):
@@ -442,19 +457,21 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         question += f"\nVraag: {query}"
     # The dressing first, cached on its own: a next question within a few minutes only pays for the question.
     content = [{"type": "text", "text": wardrobe, "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": question}]
-    report(step="Outfits samenstellen")
-    got = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=content, helpers=helpers))
+    complex_ = demanding(query, previous)
+    report(step="Outfits samenstellen voor deze dresscode" if complex_ else "Outfits samenstellen")
+    got = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=content, helpers=helpers,
+                            effort="medium" if complex_ else "low", tier="complex" if complex_ else ""))
     by_id = {i["id"]: i for i in available}
     outfits, problems = _outfits(got, by_id, len((previous or {}).get("outfits") or []))
     if problems:
-        # Asked once more with what is wrong (the dressing is cached, so this costs little); kept when it is better.
+        # Asked once more with what is wrong, of the strongest model (tier "review"); kept when it is better.
         report(step="Outfits nakijken")
         shown = "\n".join(f"Outfit {n} '{o['title']}': " + ", ".join(f"{i} ({names[i]})" for i in o["item_ids"])
                           for n, o in enumerate(outfits, 1)) or "geen bruikbare outfits"
         fix = (f"Je antwoord:\n{shown}\n\nDat klopt niet:\n" + "\n".join(f"- {p}" for p in problems) +
                "\n\nRoep geef_outfits opnieuw aan met alle outfits, verbeterd. Verander verder niets aan wat goed was.")
         again = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=[*content, {"type": "text", "text": fix}],
-                                  helpers=helpers))
+                                  helpers=helpers, tier="review"))
         better, left = _outfits(again, by_id, len((previous or {}).get("outfits") or []))
         if better and len(left) < len(problems):
             got, outfits = again, better

@@ -5,6 +5,7 @@ content and tool into OpenAI's, runs the conversation until the model calls the 
 and turns OpenAI's errors into Dutch messages.
 """
 
+import base64
 import json
 import os
 import re
@@ -12,10 +13,16 @@ import re
 import openai
 
 from . import auth, costs, keys
-from .claude import TOO_SLOW, ClaudeError, Helpers, run_helper
+from .claude import TOO_SLOW, ClaudeError, Helpers, run_helper, thrifty
 
+# Which model does what: Luna recognises photos and puts everyday outfits together; Sol takes a dress code or a look
+# to recreate; Astra takes a second try when an answer failed its check; Flare draws an outfit. A model the account
+# picked under Instellingen wins over Sol and Astra, and Zuinig keeps everything on Luna (but the picture).
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
 HELPER_MODEL = os.environ.get("OPENAI_HELPER_MODEL", "gpt-6-luna")  # the cheap model of "Zuinig"
+COMPLEX_MODEL = os.environ.get("OPENAI_COMPLEX_MODEL", "gpt-6.1-sol")
+REVIEW_MODEL = os.environ.get("OPENAI_REVIEW_MODEL", "gpt-6-astra")
+IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare")
 _clients: dict[str, openai.AsyncOpenAI] = {}
 _no_reasoning: set[str] = set()  # models that rejected the reasoning (effort) setting
 _no_breakpoints: set[str] = set()  # models before gpt-5.6, which reject cache breakpoints
@@ -24,6 +31,15 @@ CACHED = {"mode": "explicit"}
 
 def model(user: dict) -> str:
     return auth.user_settings(user).get("openai_model") or DEFAULT_MODEL
+
+
+def model_for(user: dict, tier: str) -> str:
+    """The model for one kind of work: "complex" (a dress code, a look to recreate) or "review" (a second try after
+    a failed check); anything else is the account's model."""
+    upgrade = {"complex": COMPLEX_MODEL, "review": REVIEW_MODEL}.get(tier)
+    if not upgrade or model(user) != DEFAULT_MODEL or thrifty(user):
+        return model(user)
+    return upgrade
 
 
 def client(user: dict) -> openai.AsyncOpenAI:
@@ -216,3 +232,48 @@ async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: l
         kwargs = {**common, "previous_response_id": response.id, "tool_choice": {"type": "function", "name": tool_name},
                   "input": [{"role": "user", "content": f"Roep nu de functie {tool_name} aan met je resultaat."}]}
     raise ClaudeError("Geen resultaat ontvangen van ChatGPT. Probeer opnieuw.")
+
+
+# MARK: - A picture of an outfit
+
+DRAW_PROMPT = """Een realistische modefoto van één persoon die precies dit outfit draagt, van top tot teen, staand, het gezicht buiten beeld of afgewend, tegen een rustige effen achtergrond in daglicht.
+
+De meegestuurde foto's zijn de kledingstukken zelf: neem elk stuk exact over (kleur, patroon, stof, snit, details zoals knopen, kraag, print of logo). Verzin geen andere kledingstukken, accessoires of schoenen dan deze. Een stuk zonder foto staat enkel beschreven: teken het zo eenvoudig en neutraal mogelijk naar die beschrijving.
+
+De stukken:
+{pieces}"""
+MAX_DRAWN = 8  # photos of pieces sent along; more makes the picture no better and the question dearer
+
+
+async def draw_outfit(user: dict, pieces: list[tuple[str, bytes | None]]) -> bytes:
+    """A JPEG of someone wearing these pieces (a description, and the photo of the piece if there is one), drawn by
+    IMAGE_MODEL from the photos themselves. Uses the account's OpenAI key, also when the account chose Claude."""
+    key, source = keys.active_key(user, "openai")
+    if source == "locked":
+        raise ClaudeError("Je OpenAI-sleutel is vergrendeld op dit toestel. Log uit en opnieuw in om hem te ontgrendelen.")
+    if not key:
+        raise ClaudeError("Een beeld van een outfit tekent ChatGPT: voeg een OpenAI-sleutel toe bij Instellingen.")
+    photos = [(f"stuk-{n}.jpg", jpeg, "image/jpeg") for n, (_, jpeg) in enumerate(pieces, 1) if jpeg][:MAX_DRAWN]
+    if not photos:
+        raise ClaudeError("Geen van deze stukken heeft een foto: zonder foto's kan er geen getrouw beeld gemaakt worden.")
+    lines, n = [], 0
+    for text, jpeg in pieces:
+        if jpeg and n < MAX_DRAWN:
+            n += 1
+            lines.append(f"- {text} (foto stuk-{n})")
+        else:
+            lines.append(f"- {text} (geen foto)")
+    try:
+        response = await client(user).images.edit(model=IMAGE_MODEL, image=photos, prompt=DRAW_PROMPT.format(pieces="\n".join(lines)),
+                                                  size="1024x1536", quality="medium", output_format="jpeg", output_compression=85)
+    except openai.BadRequestError as e:
+        if "safety" in str(e.message).lower() or "moderation" in str(e.message).lower():
+            raise ClaudeError("ChatGPT wilde dit beeld niet maken. Probeer een ander outfit.")
+        raise _error(e)
+    except openai.OpenAIError as e:
+        raise _error(e)
+    costs.track_openai_image(IMAGE_MODEL, response)
+    data = response.data[0].b64_json if response.data else None
+    if not data:
+        raise ClaudeError("Geen beeld ontvangen van ChatGPT. Probeer opnieuw.")
+    return base64.b64decode(data)

@@ -103,7 +103,7 @@ def test_stylist_gets_only_what_is_in_the_dressing(client, monkeypatch):
     client.put("/api/settings/place", json={"place": ""}, headers=H)
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen["text"] = "\n".join(c["text"] for c in content)
         return {"advies": "Fris.", "outfits": [{"titel": "Look", "stukken": [here["id"], washing["id"], "verzonnen"], "waarom": "Past."}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -125,7 +125,7 @@ def test_stylist_uses_the_weather(client, monkeypatch):
     monkeypatch.setattr(weather, "forecast", forecast)
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen["text"] = content[-1]["text"]
         return {"advies": "", "outfits": []}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -204,7 +204,7 @@ def test_openai_key_is_checked_and_kept_apart(client, monkeypatch):
 def test_order_mail_gives_pieces_with_their_photos(client, monkeypatch):
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen["tool"], seen["text"] = tool["name"], content[-1]["text"]
         seen["labels"] = [c["text"] for c in content if c["type"] == "text"][:-1]
         seen["images"] = sum(c["type"] == "image" for c in content)
@@ -254,7 +254,7 @@ def test_suitcase_trip_and_stylist(client, monkeypatch):
     assert trip["place"]["name"] == "Barcelona, Spanje" and trip["item_ids"] == []
     seen = []
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen.append("\n".join(c["text"] for c in content))
         return {"advies": "", "outfits": [{"titel": "Look", "stukken": [shirt["id"], coat["id"]], "waarom": "."}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -297,7 +297,7 @@ def test_order_from_screenshots_cuts_out_the_photos(client, monkeypatch):
     shot.save(out, "PNG")
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen["labels"] = [c["text"] for c in content if c["type"] == "text"]
         w = 725  # the screenshot as the AI sees it: 1170×2532 brought to 1568 high
         scale = w / 1170
@@ -399,7 +399,7 @@ def test_photo_work_runs_off_the_event_loop(client, monkeypatch):
         return {"name": "Trui", "category": "trui"}
     monkeypatch.setattr(claude, "identify_item", fake_identify)
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         return {"winkel": "Zara", "stukken": [{"naam": "Trui", "categorie": "trui", "foto": 1, "screenshot": 1, "vak": [10, 10, 200, 300]}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
     monkeypatch.setattr(main, "_fetch_photo", lambda url: real(jpeg(), 1200, 78))
@@ -526,7 +526,7 @@ def shot_png() -> bytes:
 def test_inspiration_from_screenshots_makes_the_style_the_stylist_uses(client, monkeypatch):
     seen = []
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen.append((tool["name"], "\n".join(c["text"] for c in content if c["type"] == "text")))
         if tool["name"] == "geef_outfits":
             return {"advies": "", "outfits": []}
@@ -571,7 +571,7 @@ def test_inspiration_from_a_pinterest_link(client, monkeypatch):
     fetched = []
     monkeypatch.setattr(main, "_fetch_page_photo", lambda url: fetched.append(url) or jpeg())
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         return {"looks": [{"foto": 1, "beschrijving": "Camel jas over grijze trui"}], "profiel": "Warme neutrale tinten."}
     monkeypatch.setattr(claude, "_ask", fake_ask)
     r = client.post("/api/inspiration", data={"url": " http://pin.it/abc "}, headers=H)
@@ -607,7 +607,7 @@ def test_style_profile_rewritten_and_edited(client, monkeypatch):
     assert client.post("/api/inspiration/profile", headers=H).status_code == 400  # nothing to write it from yet
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen["text"] = content[-1]["text"]
         return {"looks": [{"foto": 1, "beschrijving": "Zwarte jurk met sneakers"}] if len(content) > 1 else [],
                 "profiel": "Zwart, sportief-chic."}
@@ -653,7 +653,7 @@ def test_import_a_board_in_batches_without_pins_already_there(client, monkeypatc
     monkeypatch.setattr(main, "_pin_photo", lambda picture: None if "/3.jpg" in picture else jpeg())
     batches = []
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         n = sum(c["type"] == "image" for c in content)
         batches.append(n)
         return {"looks": [{"foto": i, "beschrijving": f"Look {len(batches)}.{i}"} for i in range(1, n + 1)],
@@ -690,7 +690,7 @@ def test_rejected_outfit_is_remembered_by_the_stylist(client, monkeypatch):
 
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen["text"] = "\n".join(c["text"] for c in content)
         return {"advies": "", "outfits": []}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -713,7 +713,7 @@ def test_follow_up_adjusts_the_earlier_suggestion(client, monkeypatch):
     hemd, sneakers = add(client, name="Wit hemd"), add(client, name="Witte sneakers", category="schoenen")
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen["question"] = content[-1]["text"]
         return {"advies": "Andere schoenen.", "outfits": [{"titel": "Look", "stukken": [hemd["id"], sneakers["id"]], "waarom": "Past."}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -733,7 +733,7 @@ def test_stylist_knows_the_season(client, monkeypatch):
     add(client, name="Linnen hemd", seasons=["zomer"])
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         seen["text"], seen["system"] = "\n".join(c["text"] for c in content), system
         return {"advies": "", "outfits": []}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -752,7 +752,7 @@ def test_outfit_without_shoes_is_completed(client, monkeypatch):
         {"advies": "Verbeterd.", "outfits": [{"titel": "Met schoenen", "stukken": [hemd["id"], broek["id"], laarzen["id"]], "waarom": "."}]},
     ]
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         asked.append(content[-1]["text"])
         return answers[len(asked) - 1]
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -776,7 +776,7 @@ def test_follow_up_keeps_every_outfit(client, monkeypatch):
     sneakers, laarzen = add(client, name="Sneakers", category="schoenen"), add(client, name="Laarzen", category="schoenen")
     asked = []
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
         asked.append(content[-1]["text"])
         one = {"titel": "Een", "stukken": [hemd["id"], laarzen["id"]], "waarom": "."}
         two = {"titel": "Twee", "stukken": [trui["id"], laarzen["id"]], "waarom": "."}
@@ -786,3 +786,109 @@ def test_follow_up_keeps_every_outfit(client, monkeypatch):
         {"title": "Een", "item_ids": [hemd["id"], sneakers["id"]]}, {"title": "Twee", "item_ids": [trui["id"], sneakers["id"]]}]}}, headers=H).json()
     assert "Geef alle outfits uit je voorstel terug" in asked[0]
     assert len(asked) == 2 and "had 2 outfits en je gaf er 1 terug" in asked[1] and len(r["outfits"]) == 2
+
+
+def _chatgpt_stylist(client, monkeypatch, answers):
+    """ChatGPT as the stylist, answering with `answers` in turn; returns the models it was asked with."""
+    models = []
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            models.append(kwargs["model"])
+            call = SimpleNamespace(type="function_call", name="geef_outfits", arguments=answers[min(len(models), len(answers)) - 1])
+            return SimpleNamespace(id=f"r{len(models)}", output=[call], status="completed")
+    monkeypatch.setattr(gpt, "client", lambda user: SimpleNamespace(responses=FakeResponses()))
+    client.put("/api/settings/provider", json={"provider": "openai"}, headers=H)
+    return models
+
+
+def test_chatgpt_takes_the_stronger_model_for_a_dress_code(client, monkeypatch):
+    add(client, name="Wit hemd")
+    models = _chatgpt_stylist(client, monkeypatch, ['{"advies": "Ok.", "outfits": []}'])
+    client.post("/api/stylist", json={"query": "Een gewone werkdag", "use_weather": False}, headers=H)
+    client.post("/api/stylist", json={"query": "Trouwfeest als gast, dresscode cocktail", "use_weather": False}, headers=H)
+    assert models == [gpt.DEFAULT_MODEL, gpt.COMPLEX_MODEL]
+
+
+def test_a_chosen_model_or_zuinig_keeps_everything_on_one_model(client, monkeypatch):
+    add(client, name="Wit hemd")
+    models = _chatgpt_stylist(client, monkeypatch, ['{"advies": "Ok.", "outfits": []}'])
+    client.put("/api/settings/quality", json={"quality": "zuinig"}, headers=H)
+    client.post("/api/stylist", json={"query": "Sollicitatiegesprek", "use_weather": False}, headers=H)
+    client.put("/api/settings/quality", json={"quality": "standaard"}, headers=H)
+    main.auth.put_user_setting(client.get("/api/state").json()["user"], "openai_model", "gpt-6-sol")
+    client.post("/api/stylist", json={"query": "Sollicitatiegesprek", "use_weather": False}, headers=H)
+    assert models == [gpt.DEFAULT_MODEL, "gpt-6-sol"]
+
+
+def test_a_failed_check_is_retried_with_the_review_model(client, monkeypatch):
+    shirt = add(client, name="Wit hemd")
+    bad = '{"advies": "Ok.", "outfits": [{"titel": "A", "stukken": ["bestaat-niet"], "waarom": "x"}]}'
+    good = '{"advies": "Ok.", "outfits": [{"titel": "A", "stukken": ["%s"], "waarom": "x"}]}' % shirt["id"]
+    models = _chatgpt_stylist(client, monkeypatch, [bad, good])
+    r = client.post("/api/stylist", json={"query": "Een gewone werkdag", "use_weather": False}, headers=H)
+    assert models == [gpt.DEFAULT_MODEL, gpt.REVIEW_MODEL]
+    assert r.json()["outfits"][0]["item_ids"] == [shirt["id"]]
+
+
+def test_demanding_questions():
+    assert claude.demanding("Sollicitatiegesprek bij een bank")
+    assert claude.demanding("Maak deze look na met mijn kleren: zwarte blazer")
+    assert claude.demanding("andere schoenen", {"queries": ["Huwelijk in juni"]})
+    assert not claude.demanding("Luie zondag thuis")
+
+
+def test_outfit_picture_only_of_own_pieces_and_only_when_asked(client, monkeypatch):
+    shirt = add(client, name="Wit hemd", colors=["wit"])
+    r = client.post(f"/api/items/{shirt['id']}/photo", files={"photo": ("f.jpg", jpeg(), "image/jpeg")}, headers=H)
+    assert r.status_code == 200, r.text
+    jeans = add(client, name="Jeans", category="broek")
+    drawn = []
+
+    async def fake_draw(user, pieces):
+        drawn.append(pieces)
+        return b"\xff\xd8beeld"
+    monkeypatch.setattr(gpt, "draw_outfit", fake_draw)
+    # Asking the stylist never draws.
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
+        return {"advies": "", "outfits": [{"titel": "A", "stukken": [shirt["id"], jeans["id"]], "waarom": "x"}]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    assert client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H).status_code == 200
+    assert drawn == []
+
+    r = client.post("/api/outfit-picture", json={"item_ids": [shirt["id"], jeans["id"]]}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["image"].startswith("data:image/jpeg;base64,")
+    (shirt_text, shirt_photo), (jeans_text, jeans_photo) = drawn[0]
+    assert "Wit hemd" in shirt_text and shirt_photo and jeans_photo is None
+
+    # Another account's piece is refused, as is a made-up id.
+    client.post("/api/users", json={"username": "ander", "password": "geheim456"}, headers=H)
+    with db.connect() as conn:
+        other = conn.execute("SELECT id FROM users WHERE username = 'ander'").fetchone()["id"]
+        conn.execute("INSERT INTO items (id, user_id, date_added, has_photo, data) VALUES ('vreemd', ?, '2026-01-01', 0, '{}')", (other,))
+    assert client.post("/api/outfit-picture", json={"item_ids": [shirt["id"], "vreemd"]}, headers=H).status_code == 404
+    assert client.post("/api/outfit-picture", json={"item_ids": ["../x"]}, headers=H).status_code == 400
+    assert len(drawn) == 1
+
+
+def test_drawing_needs_a_photo_and_an_openai_key(monkeypatch):
+    import asyncio
+    user = {"id": "u", "is_admin": False}
+    monkeypatch.setattr(gpt.keys, "active_key", lambda user, name="claude": (None, None))
+    with pytest.raises(claude.ClaudeError, match="OpenAI-sleutel"):
+        asyncio.run(gpt.draw_outfit(user, [("Wit hemd", b"x")]))
+    monkeypatch.setattr(gpt.keys, "active_key", lambda user, name="claude": ("sk-test", "app"))
+    with pytest.raises(claude.ClaudeError, match="foto"):
+        asyncio.run(gpt.draw_outfit(user, [("Wit hemd", None)]))
+
+
+def test_cost_of_a_picture_and_of_astra():
+    pic = costs.from_openai_image("gpt-image-2.5-flare", {"input_tokens": 1500, "output_tokens": 2000,
+                                                          "input_tokens_details": {"image_tokens": 1000, "text_tokens": 500}})
+    assert pic.status == "estimated"
+    assert pic.cost_usd == pytest.approx((500 * 5.0 + 1000 * 8.0 + 2000 * 30.0) / 1_000_000)
+    assert costs.from_openai_image("gpt-image-2.5-flare", {"input_tokens": 10, "output_tokens": 5}).status == "partial"
+    astra = costs.from_openai("gpt-6-astra", {"input_tokens": 1000, "output_tokens": 100,
+                                              "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}})
+    assert astra.cost_usd == pytest.approx((1000 * 10.0 + 100 * 50.0) / 1_000_000)

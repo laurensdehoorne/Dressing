@@ -50,6 +50,14 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
 - **Claude of ChatGPT**, te kiezen per account bij **Instellingen → AI-dienst**. Je kan voor beide een sleutel
   bewaren en wisselen wanneer je wil; de herkenning en de stylist stellen dezelfde vragen aan beide diensten.
   ChatGPT loopt via de Responses API van OpenAI.
+- **Bij ChatGPT kiest de stylist zelf het model**: `gpt-6-luna` herkent foto's en stelt gewone outfits samen,
+  `gpt-6.1-sol` neemt een dresscode of een look om na te maken (huwelijk, sollicitatie, cocktail, …), en `gpt-6-astra`
+  krijgt een tweede kans als een antwoord niet door de controle raakt (een onbekend stuk, geen schoenen). Kies je zelf
+  een model bij Instellingen, of *Zuinig*, dan doet dat ene model alles. Sol kost ongeveer 20 keer zoveel als Luna,
+  Astra ongeveer 100 keer.
+- **Toon als beeld**: bij elk voorgesteld outfit kan je met een knop een beeld laten tekenen van iemand die het draagt
+  (`gpt-image-2.5-flare`, naar de foto's van je eigen stukken). Enkel als je erop tikt, en enkel met een OpenAI-sleutel;
+  het beeld wordt niet bewaard.
 - **Eigen API-sleutel per account** (per dienst), versleuteld met het wachtwoord van dat account (AES-GCM, sleutel afgeleid met
   scrypt): niet leesbaar in de database of in back-ups. De beheerder kan terugvallen op `ANTHROPIC_API_KEY` of `OPENAI_API_KEY` uit `.env`.
 - **Model** naar keuze bij Instellingen, per dienst (standaard `claude-sonnet-5-5` en `gpt-6-luna`, of `CLAUDE_MODEL` en
