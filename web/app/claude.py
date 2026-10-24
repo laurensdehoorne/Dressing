@@ -328,6 +328,16 @@ async def read_inspiration(user: dict, shots: list[tuple[bytes, tuple[int, int]]
 
 # MARK: - The stylist
 
+REJECTED_SHOWN = 25  # the latest turned-down outfits the stylist sees
+
+def _rejected_line(r: dict, names: dict[str, str]) -> str:
+    line = f"{r['at'][:10]}: " + " + ".join(names.get(i, "?") for i in r.get("item_ids", []))
+    if r.get("query"):
+        line += f" (voor '{r['query'][:80]}')"
+    why = [*r.get("reasons", []), *([f"'{r['note'][:120]}'"] if r.get("note") else [])]
+    return line + (": " + ", ".join(why) if why else "")
+
+
 def _item_line(item: dict, wear: dict) -> str:
     """One piece for the stylist: only what it needs to choose, to keep the question small."""
     parts = [item["id"], db.CATEGORIES.get(item.get("category"), "?")]
@@ -356,10 +366,12 @@ def _item_line(item: dict, wear: dict) -> str:
 
 async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[dict], *, weather: str = "",
                           profile: str = "", style: str = "", packed: list[str] | None = None,
-                          weather_at: Callable[[dict], Awaitable[str]] | None = None) -> dict:
+                          weather_at: Callable[[dict], Awaitable[str]] | None = None, rejected: list[dict] = (),
+                          previous: dict | None = None) -> dict:
     """1 to 3 outfits from the pieces in the dressing for this question (an occasion, the weather, a mood); on a trip
     (packed: what is in the suitcase) only from the suitcase. style: the profile the AI wrote from outfits the user
-    likes (Inspiratie). With weather_at the stylist can look up the weather of
+    likes (Inspiratie). rejected: outfits the user turned down, and why. previous: for a follow-up ("andere schoenen"),
+    what was asked before and what was suggested, to adjust rather than start over. With weather_at the stylist can look up the weather of
     another place or a later day the question is about (an outing to Amsterdam, Saturday)."""
     wear: dict[str, dict] = {}
     for log in sorted(worn, key=lambda l: l["date"]):
@@ -396,6 +408,8 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         wardrobe = f"Over mij: {profile}\n\n{wardrobe}"
     if taste:
         wardrobe += "\n\nWat ik eerder droeg en hoe het viel:\n" + "\n".join(taste)
+    if refused := [_rejected_line(r, names) for r in rejected[:REJECTED_SHOWN]]:
+        wardrobe += "\n\nOutfits die je voorstelde en die ik afwees, met waarom:\n" + "\n".join(refused)
     question = f"Vandaag is het {date.today().isoformat()}."
     if weather:
         question += f"\n{weather}"
@@ -403,7 +417,18 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
     if helpers:
         question += ("\nGaat de vraag over een andere plaats dan hierboven (een uitstap, een reis, een feest elders) of over "
                      "een dag na morgen, vraag dan eerst het weer van die plaats en die dag op met weer_opvragen en kies naar dat weer.")
-    question += f"\nVraag: {query}"
+    if previous:
+        asked = " → ".join(previous.get("queries") or [])
+        shown = []
+        for n, o in enumerate(previous.get("outfits") or [], 1):
+            pieces = ", ".join(f"{i} ({names[i]})" for i in o.get("item_ids", []) if i in names)
+            shown.append(f"Outfit {n} '{o.get('title') or ''}': {pieces}")
+        question += f"\nEerder vroeg ik: {asked}\nJe stelde voor:\n" + "\n".join(shown)
+        question += ("\nIk stuur je voorstel bij. Pas het aan zoals ik vraag en houd wat ik niet vernoem; de eerdere vraag "
+                     "(gelegenheid, weer) blijft gelden.")
+        question += f"\nBijsturing: {query}"
+    else:
+        question += f"\nVraag: {query}"
     # The dressing first, cached on its own: a next question within a few minutes only pays for the question.
     content = [{"type": "text", "text": wardrobe, "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": question}]
     report(step="Outfits samenstellen")
@@ -540,6 +565,8 @@ Kies zoals een stylist dat doet:
 - Kleuren die samengaan: neutrale basis (marine, grijs, beige, zwart, wit, ecru) met hoogstens één of twee accentkleuren; patronen hoogstens één opvallend stuk, tenzij ze bewust combineren. Materialen en stijl in dezelfde lijn.
 - Laat stukken die al lang niet of nog nooit gedragen zijn eens aan bod komen als ze goed passen, en wissel af met wat de laatste dagen al gedragen werd. Favorieten mogen vaker.
 - Wat de gebruiker eerder droeg en hoe het viel (score op 5, notitie), telt mee om te kiezen tussen outfits die al goed passen.
+- Outfits die de gebruiker afwees, stel je niet opnieuw voor (ook niet bijna hetzelfde). Leer van de reden: 'te formeel' bij een vraag voor kantoor betekent dat kantoor minder formeel mag; 'kleuren botsen' of 'combineer ik nooit' gaat over die combinatie van stukken; 'draag ik niet graag' over een van de stukken.
+- Stuurt de gebruiker een vorig voorstel bij ('andere schoenen', 'minder chic'), pas dan dat voorstel aan en verander enkel wat gevraagd wordt; zeg in advies kort wat je veranderde.
 - Staat er een stijl uit outfits die de gebruiker mooi vindt, kies dan in die geest: dezelfde kleuren, silhouetten en combinaties waar de dressing dat toelaat. Het is smaak, geen filter: het weer en de gelegenheid gaan voor. Vraagt de gebruiker een look na te maken, benader die zo dicht mogelijk met eigen kleren en zeg in ontbreekt welk stuk de look echt zou afmaken.
 
 Harde voorwaarden in de vraag (een kleur, een bepaald stuk, 'geen jeans', 'iets in het rood') zijn een filter, geen voorkeur. Ontbreekt er iets wezenlijks in de dressing voor deze vraag (bv. geen regenjas, geen nette schoenen), zeg dat kort in ontbreekt; dat is een tip om te kopen. Liever één goed outfit dan drie halve.

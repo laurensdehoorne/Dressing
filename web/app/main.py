@@ -307,7 +307,7 @@ def delete_user(user_id: str, admin: Admin, request: Request):
             raise HTTPException(404, "Account niet gevonden.")
         items = [r["id"] for r in conn.execute("SELECT id FROM items WHERE user_id = ?", (user_id,))]
         items += [r["id"] for r in conn.execute("SELECT id FROM inspiration WHERE user_id = ?", (user_id,))]
-        for table in ("worn", "items", "inspiration", "sessions", "ai_usage", "request_keys", "push_subscriptions"):
+        for table in ("worn", "rejected", "items", "inspiration", "sessions", "ai_usage", "request_keys", "push_subscriptions"):
             conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         audit.record(request, "account_deleted", row["username"], None, conn)
@@ -374,9 +374,10 @@ def state(user: User):
             "items": [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ? ORDER BY date_added DESC", (user["id"],))],
             "worn": [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user["id"],))],
             "inspiration": [db.inspiration_row(r) for r in _inspiration(conn, user, newest_first=True)],
+            "rejected": [db.rejected_row(r) for r in _rejected(conn, user)],
             "categories": [{"key": k, "label": v} for k, v in db.CATEGORIES.items()],
             "statuses": [{"key": k, "label": v} for k, v in db.STATUSES.items()],
-            "seasons": db.SEASONS, "formality": db.FORMALITY, "warmth": db.WARMTH,
+            "seasons": db.SEASONS, "formality": db.FORMALITY, "warmth": db.WARMTH, "reject_reasons": REJECT_REASONS,
             "ai": _ai_info(user),
             "ai_usage": costs.overview(conn, user),
             "place": settings.get("place"),
@@ -638,6 +639,57 @@ def delete_worn(log_id: str, user: User):
     with db.connect() as conn:
         if not conn.execute("DELETE FROM worn WHERE id = ? AND user_id = ?", (log_id, user["id"])).rowcount:
             raise HTTPException(404, "Outfit niet gevonden.")
+    return {"ok": True}
+
+
+# MARK: - Rejected (suggested outfits that weren't right, and why)
+
+REJECT_REASONS = ["Te formeel", "Te sportief", "Te warm", "Te koud", "Kleuren botsen", "Combineer ik nooit",
+                  "Past niet bij de gelegenheid", "Draag ik niet graag"]
+REJECTED_KEPT = 100  # older ones go: tastes change, and the stylist only sees the latest
+
+
+def _rejected(conn, user: dict, limit: int = REJECTED_KEPT) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM rejected WHERE user_id = ? ORDER BY at DESC, rowid DESC LIMIT ?", (user["id"], limit)).fetchall()
+
+
+class RejectedIn(BaseModel):
+    item_ids: list[str]
+    reasons: list[str] = []
+    note: str = ""
+    query: str = ""
+    title: str = ""
+    request_id: str = ""  # the app's id for this save (see _once)
+
+
+@app.post("/api/rejected")
+def add_rejected(body: RejectedIn, user: User):
+    return _once(user, body.request_id, lambda: _add_rejected(body, user))
+
+
+def _add_rejected(body: RejectedIn, user: dict) -> dict:
+    reasons = list(dict.fromkeys(r for r in body.reasons if r in REJECT_REASONS))
+    note = body.note.strip()[:300]
+    if not reasons and not note:
+        raise HTTPException(400, "Zeg kort wat er niet goed aan was.")
+    with db.connect() as conn:
+        ids = list(dict.fromkeys(i for i in body.item_ids if i in _own_item_ids(conn, user)))
+        if not ids:
+            raise HTTPException(400, "Dit outfit bestaat niet meer.")
+        data = {"item_ids": ids, "reasons": reasons, "note": note, "query": body.query.strip()[:300], "title": body.title.strip()[:120]}
+        rejected_id = db.new_id()
+        conn.execute("INSERT INTO rejected (id, user_id, at, data) VALUES (?, ?, ?, ?)", (rejected_id, user["id"], db.now_iso(), json.dumps(data)))
+        conn.execute("DELETE FROM rejected WHERE user_id = ? AND id NOT IN (SELECT id FROM rejected WHERE user_id = ? "
+                     "ORDER BY at DESC, rowid DESC LIMIT ?)", (user["id"], user["id"], REJECTED_KEPT))
+        return db.rejected_row(conn.execute("SELECT * FROM rejected WHERE id = ?", (rejected_id,)).fetchone())
+
+
+@app.delete("/api/rejected/{rejected_id}")
+def delete_rejected(rejected_id: str, user: User):
+    """Forgotten: the stylist may suggest this outfit again."""
+    with db.connect() as conn:
+        if not conn.execute("DELETE FROM rejected WHERE id = ? AND user_id = ?", (rejected_id, user["id"])).rowcount:
+            raise HTTPException(404, "Deze afkeuring bestaat niet meer.")
     return {"ok": True}
 
 
@@ -1184,10 +1236,22 @@ async def trip_weather(user: User):
     return await weather.trip_forecast(trip["place"], trip["start"], trip["end"])
 
 
+class EarlierOutfit(BaseModel):
+    title: str = ""
+    item_ids: list[str] = []
+
+
+class EarlierAnswer(BaseModel):
+    """What was asked before and what the stylist suggested, for a follow-up ("andere schoenen")."""
+    queries: list[str] = []
+    outfits: list[EarlierOutfit] = []
+
+
 class StylistIn(BaseModel):
     query: str
     use_weather: bool = True
     trip: bool = False  # on the trip: from the suitcase (or, while it is empty, to pack) with the destination's weather
+    previous: EarlierAnswer | None = None  # set for a follow-up on the answer the app shows
 
 
 @app.post("/api/stylist")
@@ -1195,10 +1259,14 @@ async def stylist(body: StylistIn, user: AIUser, request: Request):
     query = body.query.strip()[:1000]
     if not query:
         raise HTTPException(400, "Waarvoor zoek je een outfit?")
-    return await _background(request, user, _analysis(user, "stylist", _stylist(user, query, body.use_weather, body.trip)))
+    previous = None
+    if body.previous and (body.previous.queries or body.previous.outfits):
+        previous = {"queries": [q.strip()[:1000] for q in body.previous.queries if q.strip()][-6:],
+                    "outfits": [{"title": o.title.strip()[:120], "item_ids": o.item_ids[:12]} for o in body.previous.outfits[:3]]}
+    return await _background(request, user, _analysis(user, "stylist", _stylist(user, query, body.use_weather, body.trip, previous)))
 
 
-async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = False):
+async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = False, previous: dict | None = None):
     settings = auth.user_settings(user)
     forecast, weather_text, packed = None, "", None
     if on_trip and (trip := settings.get("trip")):
@@ -1242,8 +1310,9 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
     with db.connect() as conn:
         items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ?", (user["id"],))]
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ?", (user["id"],))]
+        rejected = [db.rejected_row(r) for r in _rejected(conn, user, claude.REJECTED_SHOWN)]
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
-                                          style=settings.get("style_profile") or "", packed=packed, weather_at=weather_at if use_weather and not on_trip else None)
+                                          style=settings.get("style_profile") or "", packed=packed, rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None)
     return {**result, "weather": forecast, "elsewhere": elsewhere}
 
 

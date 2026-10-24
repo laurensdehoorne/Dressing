@@ -21,7 +21,7 @@ H = {"X-Dressing": "1"}
 def client(monkeypatch):
     db.init()
     with db.connect() as conn:
-        for table in ("worn", "items", "inspiration", "sessions", "login_failures", "audit_log", "ai_usage", "request_keys", "push_subscriptions", "users"):
+        for table in ("worn", "rejected", "items", "inspiration", "sessions", "login_failures", "audit_log", "ai_usage", "request_keys", "push_subscriptions", "users"):
             conn.execute(f"DELETE FROM {table}")
     monkeypatch.setattr(main.keys, "active_key", lambda user, name="claude": ("sk-test", "env"))
     with TestClient(main.app) as c:
@@ -672,3 +672,55 @@ def test_import_a_board_in_batches_without_pins_already_there(client, monkeypatc
 
     r = client.post("/api/inspiration", data={"url": "https://www.pinterest.com/laurens/geheim"}, headers=H)
     assert r.status_code == 400 and "geheim" in r.json()["detail"]
+
+
+def test_rejected_outfit_is_remembered_by_the_stylist(client, monkeypatch):
+    blazer, jeans = add(client, name="Zwarte blazer", category="blazer"), add(client, name="Blauwe jeans", category="broek")
+    assert client.post("/api/rejected", json={"item_ids": [blazer["id"]]}, headers=H).status_code == 400  # why, at least
+    r = client.post("/api/rejected", json={"item_ids": [blazer["id"], jeans["id"], "verzonnen"], "reasons": ["Te formeel", "onbekend"],
+                                           "note": "  te stijf voor vrijdag ", "query": "kantoor", "request_id": "rej-12345678"}, headers=H)
+    assert r.status_code == 200, r.text
+    rejected = r.json()
+    assert rejected["item_ids"] == [blazer["id"], jeans["id"]] and rejected["reasons"] == ["Te formeel"] and rejected["note"] == "te stijf voor vrijdag"
+    again = client.post("/api/rejected", json={"item_ids": [blazer["id"]], "reasons": ["Te formeel"], "request_id": "rej-12345678"}, headers=H)
+    assert again.json()["id"] == rejected["id"]  # a second tap keeps one
+    state = client.get("/api/state").json()
+    assert [x["id"] for x in state["rejected"]] == [rejected["id"]] and "Te formeel" in state["reject_reasons"]
+
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        seen["text"] = "\n".join(c["text"] for c in content)
+        return {"advies": "", "outfits": []}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    assert "die ik afwees" in seen["text"]
+    assert "Zwarte blazer + Blauwe jeans (voor 'kantoor'): Te formeel, 'te stijf voor vrijdag'" in seen["text"]
+
+    # Forgotten: the stylist doesn't see it any more; only the own account can.
+    client.post("/api/users", json={"username": "ander", "password": "geheim456"}, headers=H)
+    other = TestClient(main.app)
+    other.post("/api/auth/login", json={"username": "ander", "password": "geheim456"}, headers=H)
+    assert other.delete(f"/api/rejected/{rejected['id']}", headers=H).status_code == 404
+    assert other.post("/api/rejected", json={"item_ids": [blazer["id"]], "reasons": ["Te formeel"]}, headers=H).status_code == 400
+    assert client.delete(f"/api/rejected/{rejected['id']}", headers=H).status_code == 200
+    client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    assert "die ik afwees" not in seen["text"]
+
+
+def test_follow_up_adjusts_the_earlier_suggestion(client, monkeypatch):
+    hemd, sneakers = add(client, name="Wit hemd"), add(client, name="Witte sneakers", category="schoenen")
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        seen["question"] = content[-1]["text"]
+        return {"advies": "Andere schoenen.", "outfits": [{"titel": "Look", "stukken": [hemd["id"]], "waarom": "Past."}]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    r = client.post("/api/stylist", json={"query": "andere schoenen", "use_weather": False, "previous": {
+        "queries": ["etentje", "iets chiquer"], "outfits": [{"title": "Smart casual", "item_ids": [hemd["id"], sneakers["id"]]}]}}, headers=H)
+    assert r.status_code == 200, r.text
+    q = seen["question"]
+    assert "Eerder vroeg ik: etentje → iets chiquer" in q and f"{sneakers['id']} (Witte sneakers)" in q
+    assert "Bijsturing: andere schoenen" in q and "Vraag:" not in q
+    client.post("/api/stylist", json={"query": "etentje", "use_weather": False}, headers=H)
+    assert "Vraag: etentje" in seen["question"] and "Eerder vroeg ik" not in seen["question"]

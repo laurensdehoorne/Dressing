@@ -90,6 +90,14 @@ def init() -> None:
                 data TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS worn_user ON worn (user_id, date);
+            -- A suggested outfit the user turned down (item_ids, reasons, note, the question), for the stylist to learn from.
+            CREATE TABLE IF NOT EXISTS rejected (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                at TEXT NOT NULL,
+                data TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS rejected_user ON rejected (user_id, at);
             -- An outfit the user likes (a screenshot from Instagram, a pin from Pinterest), with what the AI saw in it.
             CREATE TABLE IF NOT EXISTS inspiration (
                 id TEXT PRIMARY KEY,
@@ -161,6 +169,10 @@ def item_row(row: sqlite3.Row) -> dict:
 
 def worn_row(row: sqlite3.Row) -> dict:
     return {**json.loads(row["data"]), "id": row["id"], "date": row["date"]}
+
+
+def rejected_row(row: sqlite3.Row) -> dict:
+    return {**json.loads(row["data"]), "id": row["id"], "at": row["at"]}
 
 
 def inspiration_row(row: sqlite3.Row) -> dict:

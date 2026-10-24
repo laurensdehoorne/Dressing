@@ -21,6 +21,10 @@ const SUGGESTIONS = [
     ["🎩", "Klassiek en verzorgd"], ["🎨", "Kleurrijk"], ["🖤", "Volledig in donkere tinten"]]],
 ];
 
+// Ways to adjust an answer, one tap each.
+const REFINE_SUGGESTIONS = [["👟", "Andere schoenen"], ["👔", "Iets chiquer"], ["👕", "Iets minder chic"], ["🧥", "Warmer"], ["🌬️", "Luchtiger"],
+  ["🎨", "Meer kleur"], ["🔁", "Een heel ander idee"]];
+
 const TRIP_SUGGESTIONS = [["Op reis", [["🧳", "Wat neem ik mee? Help me inpakken"], ["🗺️", "Een dag op stap in de stad"], ["🍽️", "Etentje 's avonds"],
   ["🥾", "Een wandeldag"], ["🏖️", "Een dag aan het water"], ["✈️", "De reisdag zelf"]]]];
 
@@ -28,7 +32,7 @@ let S = { items: [], worn: [], categories: [], statuses: [] };
 const ui = {
   tab: "dressing",
   category: "", search: "", sort: "added", place: "",
-  stylist: { query: "", loading: false, result: null, error: null, useWeather: true, step: "", onTrip: null },
+  stylist: { query: "", loading: false, result: null, error: null, useWeather: true, step: "", onTrip: null, thread: [], refine: "" },
   auth: null,
   tripWeather: undefined,
   weather: undefined,
@@ -127,7 +131,7 @@ function signedOut() {
   S = { items: [], worn: [], categories: [], statuses: [] };
   stack = [];
   ui.users = null; ui.models = null; ui.weather = undefined; ui.push = null;
-  ui.stylist = { query: "", loading: false, result: null, error: null, useWeather: true, step: "", onTrip: null };
+  ui.stylist = { query: "", loading: false, result: null, error: null, useWeather: true, step: "", onTrip: null, thread: [], refine: "" };
   ui.tripWeather = undefined;
   if ($("#sheet").open) closeSheet();
   render();
@@ -603,9 +607,23 @@ function renderStylist() {
   if (!aiReady()) return `${top}<div class="notice">Stel een API-sleutel voor ${h(aiService().name)} in bij Instellingen om outfits te laten voorstellen.</div>`;
   if (st.loading) return `${top}<div class="analyzing"><div class="spinner"></div><p><b>${h(st.step || "Je stylist denkt na…")}</b></p><p class="muted small">${onTrip()
     ? `Kijkt naar ${packedItems().length ? "je valies" : "je dressing"} en het weer in ${h(tripName())}.` : `Kijkt naar je dressing${st.useWeather && S.place ? ", het weer" : ""} en wat je laatst droeg.`}</p></div>`;
-  if (st.error) return `${top}<div class="notice err">${h(st.error)}</div>${suggestions()}`;
-  if (st.result) return `${top}${outfitsHTML(st.result)}<div class="buttons"><button class="btn-secondary" data-act="stylist-reset">Nieuwe vraag</button></div>`;
+  if (st.error && !st.result) return `${top}<div class="notice err">${h(st.error)}</div>${suggestions()}`;
+  if (st.result) return `${top}${st.thread.length > 1 ? `<p class="footnote">Bijgestuurd: ${st.thread.slice(1).map((q) => `‘${h(q)}’`).join(" → ")}</p>` : ""}
+    ${outfitsHTML(st.result)}${refineBox()}<div class="buttons"><button class="btn-secondary" data-act="stylist-reset">Nieuwe vraag</button></div>`;
   return `${top}${inspirationStrip()}${suggestions()}`;
+}
+
+/** Adjusting the answer that is shown ("andere schoenen"): the stylist sees its suggestion and changes only that. */
+function refineBox() {
+  const st = ui.stylist;
+  if (!st.result.outfits.length) return "";
+  return `<h2 class="section-title">Bijsturen</h2>
+    <form class="ask refine" style="margin-top:0" data-act-submit="refine"><textarea name="query" rows="1" placeholder="bv. andere schoenen, zonder blazer, iets warmer"
+      aria-label="Bijsturen" data-bind-stylist="refine">${h(st.refine)}</textarea>
+      <button class="btn-pill icon primary" aria-label="Pas het voorstel aan">↑</button></form>
+    <div class="sugg refine-sugg">${REFINE_SUGGESTIONS.map(([emoji, text]) => `<button data-act="refine-suggest" data-q="${h(text)}">${emoji} ${h(text)}</button>`).join("")}</div>
+    ${st.error ? `<div class="notice err">${h(st.error)}</div>` : ""}
+    <p class="footnote">Niet goed? Tik 👎 bij een outfit en zeg waarom: de stylist onthoudt het en stelt het niet opnieuw voor.</p>`;
 }
 
 function suggestions() {
@@ -627,31 +645,81 @@ function outfitsHTML(r) {
       : `Nog geen voorspelling voor ${h(name)}: de stylist gaat uit van het gebruikelijke weer daar`}</span></div>`;
   }).join("");
   return `${elsewhere}${r.advice ? `<p class="advice">${h(r.advice)}</p>` : ""}
-    ${r.outfits.map((o, n) => `<article class="card outfit">
+    ${r.outfits.map((o, n) => `<article class="card outfit${o.rejected ? " rejected" : ""}">
       <div class="head"><span class="n">Outfit ${n + 1}</span><h2>${h(o.title)}</h2></div>
       <div class="pieces">${o.item_ids.map(piece).join("")}</div>
       <p class="why">${h(o.reason)}</p>${o.tip ? `<p class="tip">💡 ${h(o.tip)}</p>` : ""}
-      <div class="foot">${r.trip && o.item_ids.some((id) => !packed(id)) ? `<button class="btn-secondary" data-act="pack-outfit" data-n="${n}">🧳 In de valies</button>` : ""}
-        <button class="btn-primary" data-act="wear-outfit" data-n="${n}">Dit draag ik</button></div></article>`).join("")}
+      ${o.rejected ? `<div class="notice turned-down"><span class="grow">👎 Afgekeurd: ${h(rejectWhy(o.rejected))}</span><button data-act="undo-reject" data-n="${n}">Ongedaan maken</button></div>`
+        : `<div class="foot"><button class="btn-secondary narrow" data-act="reject-outfit" data-n="${n}" aria-label="Niet goed">👎</button>
+        ${r.trip && o.item_ids.some((id) => !packed(id)) ? `<button class="btn-secondary" data-act="pack-outfit" data-n="${n}">🧳 In de valies</button>` : ""}
+        <button class="btn-primary" data-act="wear-outfit" data-n="${n}">Dit draag ik</button></div>`}</article>`).join("")}
     ${!r.outfits.length ? `<div class="notice">Geen outfit gevonden die past.</div>` : ""}
     ${r.missing ? `<div class="notice">🛍️ ${h(r.missing)}</div>` : ""}
     ${r.analysis ? `<p class="footnote" style="text-align:center">Dit antwoord kostte ${r.analysis.status === "estimated" ? "ongeveer" : "minstens"} ${euros(r.analysis.cost_eur)}.</p>` : ""}`;
 }
 
-async function askStylist(query) {
+/** A question for the stylist; with followUp, an adjustment of the answer that is shown (it sees that answer). */
+async function askStylist(query, followUp = false) {
   const st = ui.stylist;
   if (!query.trim() || st.loading) return;
-  Object.assign(st, { query, loading: true, error: null, result: null, step: "" });
+  const before = { result: st.result, thread: st.thread };
+  const previous = followUp && st.result ? { queries: st.thread, outfits: st.result.outfits.map((o) => ({ title: o.title, item_ids: o.item_ids })) } : null;
+  Object.assign(st, { loading: true, error: null, result: null, step: "" }, previous ? {} : { query });
   render();
   try {
-    const trip = onTrip();
-    st.result = await slowApi("/api/stylist", { method: "POST", json: { query, use_weather: st.useWeather, trip } },
+    const trip = previous ? before.result.trip : onTrip();
+    st.result = await slowApi("/api/stylist", { method: "POST", json: { query, use_weather: st.useWeather, trip, previous } },
       (p) => { if (p.step && p.step !== st.step) { st.step = p.step; if (ui.tab === "stylist" && !stack.length) render(); } });
     if (st.result.weather) ui.weather = st.result.weather;
     st.result.trip = trip;
-  } catch (e) { st.error = e.message; }
+    st.thread = previous ? [...before.thread, query] : [query];
+    st.refine = "";
+  } catch (e) {
+    st.error = e.message;
+    if (previous) Object.assign(st, before); // the answer stays, with the error under it
+  }
   st.loading = false;
   render();
+}
+
+// MARK: - Turning down a suggestion
+
+const rejectWhy = (r) => [...(r.reasons || []), r.note && `‘${r.note}’`].filter(Boolean).join(", ") || "niet goed";
+
+function openRejectSheet() {
+  const rj = ui.reject, o = ui.stylist.result.outfits[rj.n];
+  openSheet(`<div class="topbar"><button class="btn-plain" data-act="close-sheet">Annuleer</button><span class="title" id="sheet-title">Wat was er niet goed?</span><span class="spacer"></span></div>
+    <p class="subtitle" style="margin-top:4px">${h(o.title)}</p>
+    <div class="chips">${(S.reject_reasons || []).map((r) => `<button type="button" class="chip${rj.reasons.includes(r) ? " on" : ""}" data-act="toggle-reason" data-value="${h(r)}" aria-pressed="${rj.reasons.includes(r)}">${h(r)}</button>`).join("")}</div>
+    <div class="card" style="margin-top:14px"><div class="field"><label for="r-note">In je eigen woorden (mag leeg)</label>
+      <input id="r-note" data-bind-reject="note" value="${h(rj.note)}" placeholder="bv. die broek is te kort voor deze schoenen"></div></div>
+    ${rj.error ? `<div class="notice err">${h(rj.error)}</div>` : ""}
+    <div class="buttons"><button class="btn-primary" data-act="save-reject" ${rj.saving ? "disabled" : ""}>${rj.saving ? `<span class="spinner sm"></span>` : ""}👎 Afkeuren</button></div>
+    <p class="footnote">De stylist onthoudt dit: hij stelt dit outfit niet opnieuw voor en houdt rekening met de reden. Bij Instellingen kan je het vergeten.</p>`);
+}
+
+async function saveReject() {
+  const rj = ui.reject, st = ui.stylist, o = st.result?.outfits[rj.n];
+  if (!o || rj.saving) return;
+  if (!rj.reasons.length && !rj.note.trim()) { rj.error = "Tik een reden aan of schrijf kort wat er niet goed aan was."; return openRejectSheet(); }
+  rj.saving = true; rj.error = null; openRejectSheet();
+  try {
+    o.rejected = await api("/api/rejected", { method: "POST", json: { item_ids: o.item_ids, reasons: rj.reasons, note: rj.note,
+      query: st.thread.join(" → ") || st.query, title: o.title, request_id: rj.requestId } });
+    S.rejected = [o.rejected, ...(S.rejected || [])];
+    closeSheet(); render(); toast("Onthouden: de stylist stelt dit niet meer voor");
+  } catch (e) { rj.error = e.message; rj.saving = false; openRejectSheet(); }
+}
+
+function openRejectedList() {
+  const list = S.rejected || [];
+  const names = (r) => r.item_ids.map((id) => itemById(id)?.name).filter(Boolean).join(" + ") || "Verwijderde kleren";
+  openSheet(`<div class="topbar"><span class="spacer"></span><span class="title" id="sheet-title">Afgekeurde outfits</span><button class="btn-pill strong" data-act="close-sheet">Klaar</button></div>
+    ${list.length ? `<div class="card">${list.map((r) => `<div class="row"><span class="grow" style="min-width:0">${h(names(r))}
+        <span class="muted small" style="display:block">${h(shortDate(r.at.slice(0, 10)))}${r.query ? ` · ${h(r.query)}` : ""} · ${h(rejectWhy(r))}</span></span>
+        <button class="btn-plain small" data-act="forget-reject" data-id="${h(r.id)}">Vergeet</button></div>`).join("")}</div>`
+      : `<div class="card pad muted">Nog niets afgekeurd. Tik 👎 bij een voorgesteld outfit dat niet goed is.</div>`}
+    <p class="footnote">De stylist ziet de laatste 25 en stelt die outfits niet opnieuw voor. Vergeet je er een, dan mag hij het weer voorstellen.</p>`);
 }
 
 // MARK: - Inspiration: outfits from Instagram or Pinterest, and the style the AI writes from them
@@ -834,6 +902,9 @@ function renderSettings() {
     <p class="footnote">Gaat mee naar de stylist bij elke vraag.</p>
     <div class="card" style="margin-top:12px"><div class="row"><button class="row-button" data-act="inspiration">✨ Inspiratie van Instagram en Pinterest
       <span class="muted small" style="display:block">${looks().length ? `${plural(looks().length, "outfit", "outfits")} · je stijl gaat mee naar de stylist` : "Bewaar outfits die je mooi vindt"}</span></button>
+      <span class="muted" aria-hidden="true">›</span></div>
+      <div class="row"><button class="row-button" data-act="rejected-list">👎 Afgekeurde outfits
+      <span class="muted small" style="display:block">${S.rejected?.length ? `${plural(S.rejected.length, "outfit", "outfits")} die de stylist niet meer voorstelt` : "Nog niets afgekeurd"}</span></button>
       <span class="muted" aria-hidden="true">›</span></div></div>
     <h2 class="section-title">Weer</h2>
     <form class="card" data-act-submit="save-place">
@@ -1174,7 +1245,24 @@ const actions = {
   "edit-style": () => { stack.at(-1).editing = true; render(); },
   "cancel-style": () => { stack.at(-1).editing = false; render(); },
   "rewrite-style": () => rewriteStyle(stack.at(-1)),
-  "stylist-reset": () => { Object.assign(ui.stylist, { query: "", result: null, error: null }); render(); },
+  "stylist-reset": () => { Object.assign(ui.stylist, { query: "", result: null, error: null, thread: [], refine: "" }); render(); },
+  "refine-suggest": (el) => askStylist(el.dataset.q, true),
+  "reject-outfit": (el) => { ui.reject = { n: Number(el.dataset.n), reasons: [], note: "", requestId: requestId() }; openRejectSheet(); },
+  "toggle-reason": (el) => { const rj = ui.reject, v = el.dataset.value; rj.reasons = rj.reasons.includes(v) ? rj.reasons.filter((x) => x !== v) : [...rj.reasons, v]; openRejectSheet(); },
+  "save-reject": () => saveReject(),
+  async "undo-reject"(el) {
+    const o = ui.stylist.result.outfits[Number(el.dataset.n)];
+    try { await api(`/api/rejected/${o.rejected.id}`, { method: "DELETE" }); } catch (e) { if (!/bestaat niet/.test(e.message)) return toast(e.message); }
+    S.rejected = (S.rejected || []).filter((r) => r.id !== o.rejected.id);
+    delete o.rejected; render();
+  },
+  "rejected-list": () => openRejectedList(),
+  async "forget-reject"(el) {
+    try { await api(`/api/rejected/${el.dataset.id}`, { method: "DELETE" }); } catch (e) { return toast(e.message); }
+    S.rejected = (S.rejected || []).filter((r) => r.id !== el.dataset.id);
+    for (const o of ui.stylist.result?.outfits || []) if (o.rejected?.id === el.dataset.id) delete o.rejected;
+    openRejectedList(); render();
+  },
   async logout() { await api("/api/auth/logout", { method: "POST" }).catch(() => {}); signedOut(); },
   "password-sheet": () => passwordSheet({ title: "Wachtwoord wijzigen", submit: "change-password", current: true }),
   "add-user": () => passwordSheet({ title: "Account toevoegen", submit: "create-user", username: true }),
@@ -1257,6 +1345,7 @@ const submits = {
     await authSubmit("/api/auth/setup", form);
   },
   ask(form) { askStylist(form.query.value); },
+  refine(form) { askStylist(form.query.value, true); },
   async "save-trip"(form) {
     const page = stack.at(-1);
     Object.assign(page.draft, { destination: form.destination.value, start: form.start.value, end: form.end.value });
@@ -1383,6 +1472,7 @@ document.addEventListener("input", (e) => {
     if (results) results.innerHTML = dressingResults(); else render();
   }
   if (el.dataset.bindStylist) ui.stylist[el.dataset.bindStylist] = el.value;
+  if (el.dataset.bindReject) ui.reject[el.dataset.bindReject] = el.value;
 });
 // A mail pasted with its layout: keep where the pictures stood, as [foto N].
 document.addEventListener("paste", (e) => {
@@ -1398,7 +1488,7 @@ document.addEventListener("paste", (e) => {
 });
 // Enter sends the question; Shift+Enter makes a new line.
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && e.target.dataset?.bindStylist) { e.preventDefault(); askStylist(e.target.value); }
+  if (e.key === "Enter" && !e.shiftKey && e.target.dataset?.bindStylist) { e.preventDefault(); askStylist(e.target.value, e.target.dataset.bindStylist === "refine"); }
 });
 addEventListener("scroll", () => updateBars(), { passive: true });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && ui.auth?.user && !stack.length) load(); });

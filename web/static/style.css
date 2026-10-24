@@ -360,3 +360,11 @@ dialog.viewer .close { position: absolute; top: calc(var(--safe-top) + 12px); ri
 .outfit .foot { display: flex; gap: 10px; }
 .outfit .foot > * { flex: 1; }
 label.btn-secondary.disabled, label.btn-primary.disabled { opacity: 0.5; pointer-events: none; }
+/* Turning down or adjusting a suggestion */
+.outfit .foot > .narrow { flex: none; width: auto; padding-inline: 18px; }
+.outfit.rejected .pieces { opacity: 0.45; }
+.outfit .turned-down { margin: 12px 16px 16px; display: flex; align-items: center; gap: 10px; }
+.outfit .turned-down .grow { flex: 1; min-width: 0; }
+.outfit .turned-down button { background: none; border: 0; color: inherit; font-weight: 600; text-decoration: underline; padding: 0; white-space: nowrap; }
+.refine { margin-top: 20px; }
+.refine-sugg { margin-top: 10px; }
