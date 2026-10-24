@@ -599,7 +599,13 @@ function outfitsHTML(r) {
     return `<button class="piece" data-act="open" data-id="${h(id)}">${i.photo ? `<img src="${h(small(i.photo))}" alt="">` : `<span class="ph">${ic("shirt")}</span>`}
       <span>${h(i.name)}</span><small>${ic("pin").replace('class="ic"', 'class="ic" style="width:11px;height:11px;vertical-align:-1px"')} ${h(i.location || "geen plaats")}</small></button>`;
   };
-  return `${r.advice ? `<p class="advice">${h(r.advice)}</p>` : ""}
+  // The weather the stylist looked up for the place the question is about, e.g. an outing to Amsterdam.
+  const elsewhere = (r.elsewhere || []).map((w) => {
+    const d = w.days?.[0], name = w.place.split(",")[0];
+    return `<div class="weather-strip"><span>🌦️ ${d ? `<b>${d.min}–${d.max}°</b> ${h(d.summary)} in ${h(name)} (${h(longDate(d.date))})`
+      : `Nog geen voorspelling voor ${h(name)}: de stylist gaat uit van het gebruikelijke weer daar`}</span></div>`;
+  }).join("");
+  return `${elsewhere}${r.advice ? `<p class="advice">${h(r.advice)}</p>` : ""}
     ${r.outfits.map((o, n) => `<article class="card outfit">
       <div class="head"><span class="n">Outfit ${n + 1}</span><h2>${h(o.title)}</h2></div>
       <div class="pieces">${o.item_ids.map(piece).join("")}</div>

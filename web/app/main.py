@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager, closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -896,12 +896,34 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
             weather_text = weather.describe(forecast)
         except weather.WeatherError:
             pass  # without the weather the stylist still works; the app says the weather is missing
+    elsewhere: list[dict] = []
+
+    async def weather_at(asked: dict) -> str:
+        """The weather where and when the question is about, when that isn't here today or tomorrow."""
+        name = str(asked.get("plaats") or "").strip()[:80]
+        if not name:
+            return "Geef een plaats."
+        try:
+            first = date.fromisoformat(str(asked.get("van") or "")[:10])
+        except ValueError:
+            first = date.today()
+        try:
+            last = min(max(date.fromisoformat(str(asked.get("tot") or "")[:10]), first), first + timedelta(days=13))
+        except ValueError:
+            last = first
+        claude.report(step=f"Weer in {name} opvragen")
+        try:
+            w = await weather.trip_forecast(await weather.find_place(name), first.isoformat(), last.isoformat())
+        except weather.WeatherError as e:
+            return f"{e} Ga uit van het gebruikelijke weer in {name} in die periode."
+        elsewhere.append(w)
+        return weather.describe_days(w)
     with db.connect() as conn:
         items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ?", (user["id"],))]
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ?", (user["id"],))]
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
-                                          packed=packed)
-    return {**result, "weather": forecast}
+                                          packed=packed, weather_at=weather_at if use_weather and not on_trip else None)
+    return {**result, "weather": forecast, "elsewhere": elsewhere}
 
 
 # MARK: - Photos

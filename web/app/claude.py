@@ -5,6 +5,7 @@ import asyncio
 import base64
 import contextvars
 import os
+from collections.abc import Awaitable, Callable
 from datetime import date
 
 import anthropic
@@ -103,20 +104,32 @@ async def _create(user: dict, **kwargs):
     return await client(user).beta.messages.create(**kwargs)
 
 
-async def _ask(user: dict, tool: dict, *, system: str, content: list, effort: str = "low") -> dict:
+# Tools the AI may call on the way to its answer, by name: the tool and what answers it (its input in, text out).
+Helpers = dict[str, tuple[dict, Callable[[dict], Awaitable[str]]]]
+
+
+async def run_helper(helpers: Helpers, name: str, given) -> str:
+    try:
+        return await helpers[name][1](given if isinstance(given, dict) else {})
+    except Exception as e:  # the answer goes on without it
+        return f"Niet gelukt: {e}"
+
+
+async def _ask(user: dict, tool: dict, *, system: str, content: list, effort: str = "low", helpers: Helpers | None = None) -> dict:
     """Asks the AI service this account chose; the questions, tool and answers are the same for both."""
     if keys.provider(user) == "openai":
         from . import gpt
-        return await gpt.run_until_tool_call(user, tool, system=system, content=content, effort=effort)
-    return await _ask_claude(user, tool, system=system, content=content, effort=effort)
+        return await gpt.run_until_tool_call(user, tool, system=system, content=content, effort=effort, helpers=helpers or {})
+    return await _ask_claude(user, tool, system=system, content=content, effort=effort, helpers=helpers or {})
 
 
-async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, effort: str) -> dict:
-    """Sends the question until Claude calls `tool`, then returns that call's input. Forced tool use isn't accepted by
-    the current models, so the tool is offered and asked for by name."""
+async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, effort: str, helpers: Helpers) -> dict:
+    """Sends the question until Claude calls `tool`, then returns that call's input; a helper it calls on the way is
+    answered and the conversation goes on. Forced tool use isn't accepted by the current models, so the tool is offered
+    and asked for by name."""
     name = model(user)
     messages: list[dict] = [{"role": "user", "content": content}]
-    for _ in range(3):
+    for _ in range(3 + 2 * bool(helpers)):
         try:
             response = await _create(
                 user,
@@ -124,7 +137,7 @@ async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, eff
                 max_tokens=16000,
                 system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 messages=messages,
-                tools=[tool],
+                tools=[tool, *(t for t, _ in helpers.values())],
                 tool_choice={"type": "auto"},
                 output_config={"effort": effort},
             )
@@ -144,6 +157,11 @@ async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, eff
         for block in response.content:
             if block.type == "tool_use" and block.name == tool["name"]:
                 return dict(block.input) if isinstance(block.input, dict) else {}
+        if calls := [b for b in response.content if b.type == "tool_use" and b.name in helpers]:
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": b.id, "content": await run_helper(helpers, b.name, b.input)} for b in calls]})
+            continue
         if response.stop_reason == "refusal":
             raise ClaudeError("Claude weigerde dit verzoek. Probeer het opnieuw met een andere foto of vraag.")
         if response.stop_reason == "max_tokens":
@@ -279,9 +297,11 @@ def _item_line(item: dict, wear: dict) -> str:
 
 
 async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[dict], *, weather: str = "",
-                          profile: str = "", packed: list[str] | None = None) -> dict:
+                          profile: str = "", packed: list[str] | None = None,
+                          weather_at: Callable[[dict], Awaitable[str]] | None = None) -> dict:
     """1 to 3 outfits from the pieces in the dressing for this question (an occasion, the weather, a mood); on a trip
-    (packed: what is in the suitcase) only from the suitcase."""
+    (packed: what is in the suitcase) only from the suitcase. With weather_at the stylist can look up the weather of
+    another place or a later day the question is about (an outing to Amsterdam, Saturday)."""
     wear: dict[str, dict] = {}
     for log in sorted(worn, key=lambda l: l["date"]):
         for item_id in log.get("item_ids", []):
@@ -318,11 +338,15 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
     question = f"Vandaag is het {date.today().isoformat()}."
     if weather:
         question += f"\n{weather}"
+    helpers: Helpers = {WEATHER_TOOL["name"]: (WEATHER_TOOL, weather_at)} if weather_at else {}
+    if helpers:
+        question += ("\nGaat de vraag over een andere plaats dan hierboven (een uitstap, een reis, een feest elders) of over "
+                     "een dag na morgen, vraag dan eerst het weer van die plaats en die dag op met weer_opvragen en kies naar dat weer.")
     question += f"\nVraag: {query}"
     # The dressing first, cached on its own: a next question within a few minutes only pays for the question.
     content = [{"type": "text", "text": wardrobe, "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": question}]
     report(step="Outfits samenstellen")
-    got = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=content))
+    got = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=content, helpers=helpers))
     known = {i["id"] for i in available}
     outfits = []
     for o in got.get("outfits") or []:
@@ -427,6 +451,20 @@ Kies zoals een stylist dat doet:
 Harde voorwaarden in de vraag (een kleur, een bepaald stuk, 'geen jeans', 'iets in het rood') zijn een filter, geen voorkeur. Ontbreekt er iets wezenlijks in de dressing voor deze vraag (bv. geen regenjas, geen nette schoenen), zeg dat kort in ontbreekt; dat is een tip om te kopen. Liever één goed outfit dan drie halve.
 
 Schrijf in het Nederlands (Vlaams), warm maar kort."""
+
+WEATHER_TOOL = {
+    "name": "weer_opvragen",
+    "description": "De weersvoorspelling voor een plaats en een of meer dagen (tot 16 dagen vooruit).",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "plaats": {"type": "string", "description": "Stad of dorp, bv. 'Amsterdam' of 'Knokke'"},
+            "van": {"type": "string", "description": "Eerste dag, JJJJ-MM-DD"},
+            "tot": {"type": "string", "description": "Laatste dag, JJJJ-MM-DD; weglaten voor één dag"},
+        },
+        "required": ["plaats", "van"],
+    },
+}
 
 OUTFIT_TOOL = {
     "name": "geef_outfits",

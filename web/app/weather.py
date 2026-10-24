@@ -146,11 +146,14 @@ async def trip_forecast(place: dict, start: str, end: str) -> dict:
 
 def describe_trip(w: dict) -> str:
     """The trip and its forecast as lines for the stylist."""
-    lines = [f"Ik ben op reis in {w['place']} van {w['start']} tot en met {w['end']}."]
+    return f"Ik ben op reis in {w['place']} van {w['start']} tot en met {w['end']}.\n" + describe_days(w)
+
+
+def describe_days(w: dict) -> str:
+    """The forecast for some days at a place (as trip_forecast gives it) as lines for the stylist."""
     if not w["days"]:
-        lines.append(f"Er is nog geen weersvoorspelling voor die dagen: ga uit van het gebruikelijke weer in {w['place']} in die periode.")
-        return "\n".join(lines)
-    lines.append(f"Weer in {w['place']}:")
+        return f"Er is nog geen weersvoorspelling voor die dagen: ga uit van het gebruikelijke weer in {w['place']} in die periode."
+    lines = [f"Weer in {w['place']}:"]
     for d in w["days"]:
         lines.append(f"- {d['date']}: {d['summary']}, {d['min']} tot {d['max']} °C (gevoel {d['feels_min']} tot {d['feels_max']} °C), "
                      f"kans op neerslag {d['rain']} %, wind tot {d['wind']} km/u")

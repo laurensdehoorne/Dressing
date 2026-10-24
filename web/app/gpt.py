@@ -12,7 +12,7 @@ import re
 import openai
 
 from . import auth, keys
-from .claude import TOO_SLOW, ClaudeError
+from .claude import TOO_SLOW, ClaudeError, Helpers, run_helper
 
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
 _clients: dict[str, openai.AsyncOpenAI] = {}
@@ -167,18 +167,23 @@ def _refused(response) -> bool:
     return False
 
 
-async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: list, effort: str) -> dict:
-    """Asks until the model calls the tool's function, then returns that call's arguments (as claude._ask)."""
+def _function(tool: dict) -> dict:
+    return {"type": "function", "name": tool["name"], "description": tool.get("description", ""),
+            "parameters": tool["input_schema"], "strict": False}
+
+
+async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: list, effort: str, helpers: Helpers) -> dict:
+    """Asks until the model calls the tool's function, then returns that call's arguments (as claude._ask); a helper it
+    calls on the way is answered and the conversation goes on."""
     name, tool_name = model(user), tool["name"]
-    function = {"type": "function", "name": tool_name, "description": tool.get("description", ""),
-                "parameters": tool["input_schema"], "strict": False}
     # Cached up to the end of the fixed instructions, and wherever claude.py caches (the dressing). Top-level
     # `instructions` can't hold a breakpoint, so they go in as a developer message.
     fixed = {"role": "developer", "content": [{"type": "input_text", "text": system, "prompt_cache_breakpoint": CACHED}]}
-    common = {"model": name, "tools": [function], "max_output_tokens": 16000, "reasoning": {"effort": effort},
+    common = {"model": name, "tools": [_function(tool), *(_function(t) for t, _ in helpers.values())],
+              "max_output_tokens": 16000, "reasoning": {"effort": effort},
               "prompt_cache_options": CACHED, "prompt_cache_key": f"dressing-{tool_name}"}
     kwargs = {**common, "input": [fixed, {"role": "user", "content": _content(content)}], "tool_choice": "auto"}
-    for _ in range(3):
+    for _ in range(3 + 2 * bool(helpers)):
         try:
             response = await _create(user, **kwargs)
         except ClaudeError:
@@ -187,6 +192,18 @@ async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: l
             raise _error(e)
         if (found := _function_input(response, tool_name)) is not None:
             return found
+        calls = [i for i in response.output or [] if getattr(i, "type", None) == "function_call" and i.name in helpers]
+        if calls:
+            answers = []
+            for call in calls:
+                try:
+                    given = json.loads(call.arguments or "{}")
+                except ValueError:
+                    given = {}
+                answers.append({"type": "function_call_output", "call_id": call.call_id,
+                                "output": await run_helper(helpers, call.name, given)})
+            kwargs = {**common, "previous_response_id": response.id, "tool_choice": "auto", "input": answers}
+            continue
         if _refused(response):
             raise ClaudeError("ChatGPT weigerde dit verzoek. Probeer het opnieuw met een andere foto of vraag.")
         details = getattr(response, "incomplete_details", None)

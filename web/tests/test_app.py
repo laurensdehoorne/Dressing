@@ -103,7 +103,7 @@ def test_stylist_gets_only_what_is_in_the_dressing(client, monkeypatch):
     client.put("/api/settings/place", json={"place": ""}, headers=H)
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low"):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
         seen["text"] = "\n".join(c["text"] for c in content)
         return {"advies": "Fris.", "outfits": [{"titel": "Look", "stukken": [here["id"], washing["id"], "verzonnen"], "waarom": "Past."}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -125,7 +125,7 @@ def test_stylist_uses_the_weather(client, monkeypatch):
     monkeypatch.setattr(weather, "forecast", forecast)
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low"):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
         seen["text"] = content[-1]["text"]
         return {"advies": "", "outfits": []}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -204,7 +204,7 @@ def test_openai_key_is_checked_and_kept_apart(client, monkeypatch):
 def test_order_mail_gives_pieces_with_their_photos(client, monkeypatch):
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low"):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
         seen["tool"], seen["text"] = tool["name"], content[-1]["text"]
         seen["labels"] = [c["text"] for c in content if c["type"] == "text"][:-1]
         seen["images"] = sum(c["type"] == "image" for c in content)
@@ -254,7 +254,7 @@ def test_suitcase_trip_and_stylist(client, monkeypatch):
     assert trip["place"]["name"] == "Barcelona, Spanje" and trip["item_ids"] == []
     seen = []
 
-    async def fake_ask(user, tool, *, system, content, effort="low"):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
         seen.append("\n".join(c["text"] for c in content))
         return {"advies": "", "outfits": [{"titel": "Look", "stukken": [shirt["id"], coat["id"]], "waarom": "."}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -296,7 +296,7 @@ def test_order_from_screenshots_cuts_out_the_photos(client, monkeypatch):
     shot.save(out, "PNG")
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low"):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
         seen["labels"] = [c["text"] for c in content if c["type"] == "text"]
         w = 725  # the screenshot as the AI sees it: 1170×2532 brought to 1568 high
         scale = w / 1170
@@ -316,3 +316,65 @@ def test_order_from_screenshots_cuts_out_the_photos(client, monkeypatch):
     assert b > 100 and r < 50  # navy: the photo, not the white around it
     too_many = [("shots", (f"{n}.png", out.getvalue(), "image/png")) for n in range(7)]
     assert client.post("/api/order/screenshots", files=too_many, headers=H).status_code == 400
+
+
+def _amsterdam(monkeypatch):
+    async def place(name):
+        assert name == "Amsterdam"
+        return {"name": "Amsterdam, Nederland", "lat": 52.4, "lon": 4.9}
+
+    async def trip_forecast(p, start, end):
+        return {"place": p["name"], "start": start, "end": end, "days": [
+            {"date": start, "summary": "regen", "min": 6, "max": 11, "feels_min": 3, "feels_max": 9, "rain": 80, "wind": 40}]}
+    monkeypatch.setattr(weather, "find_place", place)
+    monkeypatch.setattr(weather, "trip_forecast", trip_forecast)
+
+
+def test_stylist_looks_up_the_weather_where_the_question_is_about(client, monkeypatch):
+    shirt = add(client, name="Wit hemd")
+    client.put("/api/settings/place", json={"place": ""}, headers=H)
+    _amsterdam(monkeypatch)
+    sent = []
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            sent.append(kwargs)
+            if len(sent) == 1:
+                assert [t["name"] for t in kwargs["tools"]] == ["geef_outfits", "weer_opvragen"]
+                call = SimpleNamespace(type="tool_use", id="t1", name="weer_opvragen", input={"plaats": "Amsterdam", "van": "2026-10-25"})
+                return SimpleNamespace(content=[call], stop_reason="tool_use")
+            result = kwargs["messages"][-1]["content"][0]
+            assert result["tool_use_id"] == "t1" and "6 tot 11 °C" in result["content"] and "Weer in Amsterdam" in result["content"]
+            done = SimpleNamespace(type="tool_use", id="t2", name="geef_outfits",
+                                   input={"advies": "Regenjas mee.", "outfits": [{"titel": "Stad", "stukken": [shirt["id"]]}]})
+            return SimpleNamespace(content=[done], stop_reason="tool_use")
+    monkeypatch.setattr(claude, "client", lambda user: SimpleNamespace(beta=SimpleNamespace(messages=FakeMessages())))
+    r = client.post("/api/stylist", json={"query": "uitstap naar Amsterdam"}, headers=H)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["advice"] == "Regenjas mee." and body["elsewhere"][0]["place"] == "Amsterdam, Nederland"
+    assert len(sent) == 2
+
+
+def test_chatgpt_looks_up_the_weather_too(client, monkeypatch):
+    shirt = add(client, name="Wit hemd")
+    _amsterdam(monkeypatch)
+    asked = []
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            asked.append(kwargs)
+            if len(asked) == 1:
+                call = SimpleNamespace(type="function_call", name="weer_opvragen", call_id="c1",
+                                       arguments='{"plaats": "Amsterdam", "van": "2026-10-25"}')
+                return SimpleNamespace(id="r1", output=[call], status="completed")
+            assert kwargs["previous_response_id"] == "r1" and kwargs["input"][0]["call_id"] == "c1"
+            assert "6 tot 11 °C" in kwargs["input"][0]["output"]
+            call = SimpleNamespace(type="function_call", name="geef_outfits",
+                                   arguments='{"advies": "Ok.", "outfits": [{"titel": "Stad", "stukken": ["%s"]}]}' % shirt["id"])
+            return SimpleNamespace(id="r2", output=[call], status="completed")
+    monkeypatch.setattr(gpt, "client", lambda user: SimpleNamespace(responses=FakeResponses()))
+    client.put("/api/settings/provider", json={"provider": "openai"}, headers=H)
+    r = client.post("/api/stylist", json={"query": "uitstap naar Amsterdam"}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["elsewhere"][0]["days"][0]["max"] == 11
