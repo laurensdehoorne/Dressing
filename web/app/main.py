@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import html
 import io
 import ipaddress
 import json
@@ -72,7 +73,7 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
 
 # The most a request may send; only a signed-in account may upload photos.
 MAX_BODY, MAX_UPLOAD = 1_000_000, 30_000_000
-UPLOADS = {"/api/identify", "/api/order/pdf", "/api/order/screenshots"}
+UPLOADS = {"/api/identify", "/api/order/pdf", "/api/order/screenshots", "/api/inspiration"}
 
 
 class LimitBody:
@@ -304,7 +305,8 @@ def delete_user(user_id: str, admin: Admin, request: Request):
         if not row:
             raise HTTPException(404, "Account niet gevonden.")
         items = [r["id"] for r in conn.execute("SELECT id FROM items WHERE user_id = ?", (user_id,))]
-        for table in ("worn", "items", "sessions", "ai_usage", "request_keys", "push_subscriptions"):
+        items += [r["id"] for r in conn.execute("SELECT id FROM inspiration WHERE user_id = ?", (user_id,))]
+        for table in ("worn", "items", "inspiration", "sessions", "ai_usage", "request_keys", "push_subscriptions"):
             conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         audit.record(request, "account_deleted", row["username"], None, conn)
@@ -370,6 +372,7 @@ def state(user: User):
             "user": user,
             "items": [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ? ORDER BY date_added DESC", (user["id"],))],
             "worn": [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user["id"],))],
+            "inspiration": [db.inspiration_row(r) for r in _inspiration(conn, user, newest_first=True)],
             "categories": [{"key": k, "label": v} for k, v in db.CATEGORIES.items()],
             "statuses": [{"key": k, "label": v} for k, v in db.STATUSES.items()],
             "seasons": db.SEASONS, "formality": db.FORMALITY, "warmth": db.WARMTH,
@@ -378,6 +381,7 @@ def state(user: User):
             "place": settings.get("place"),
             "trip": settings.get("trip"),
             "profile": settings.get("profile") or "",
+            "style_profile": settings.get("style_profile") or "",
             "version": VERSION,
         }
 
@@ -781,15 +785,20 @@ def _shots_to_send(originals: list[Image.Image]) -> list[tuple[bytes, tuple[int,
     return sent
 
 
+def _cut(originals: list[Image.Image], sent: list, n: int, box: list[int]) -> bytes:
+    """The part of screenshot n inside box (in pixels of the copy the AI saw), cut from the sharp original."""
+    x0, y0, x1, y1 = box
+    img, scale = originals[n - 1], originals[n - 1].width / sent[n - 1][1][0]
+    out = io.BytesIO()
+    img.crop((round(x0 * scale), round(y0 * scale), round(x1 * scale), round(y1 * scale))).save(out, "JPEG", quality=85)
+    return _jpeg(out.getvalue(), 1200, 80)
+
+
 def _cut_out(found: dict, originals: list[Image.Image], sent: list) -> None:
     """Each piece's photo, cut from the sharp original where the AI says it is on the screenshot."""
     for piece in found["pieces"]:
         if crop := piece.pop("crop", None):
-            n, (x0, y0, x1, y1) = crop
-            img, scale = originals[n - 1], originals[n - 1].width / sent[n - 1][1][0]
-            out = io.BytesIO()
-            img.crop((round(x0 * scale), round(y0 * scale), round(x1 * scale), round(y1 * scale))).save(out, "JPEG", quality=85)
-            piece["jpeg"] = _jpeg(out.getvalue(), 1200, 80)
+            piece["jpeg"] = _cut(originals, sent, *crop)
 
 
 async def _read_screenshots(user: dict, originals: list[Image.Image]):
@@ -869,6 +878,36 @@ def _fetch_photo(url: str) -> bytes | None:
         return None
 
 
+PAGE_BYTES = 3_000_000
+OG_IMAGE = re.compile(r"""<meta\b[^>]*?(?:property|name)\s*=\s*["'](?:og:image(?::secure_url)?|twitter:image)["'][^>]*>""", re.I)
+CONTENT = re.compile(r"""\bcontent\s*=\s*["']([^"']+)["']""", re.I)
+
+
+def _fetch_page_photo(url: str) -> bytes | None:
+    """The picture behind a link: the link itself when it is a picture, else the page's preview picture (og:image), as
+    a Pinterest pin has. None when there is none, or the page hides it (Instagram, without signing in)."""
+    if not _public_host(url):
+        return None
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Dressing)", "Accept": "text/html,image/*"})
+    try:
+        with _opener.open(req, timeout=10) as resp:
+            kind, final = resp.headers.get("Content-Type", ""), resp.geturl()
+            data = resp.read(MAX_UPLOAD + 1 if kind.startswith("image/") else PAGE_BYTES)
+    except (OSError, ValueError):
+        return None
+    if kind.startswith("image/"):
+        try:
+            return _jpeg(data, 3000, 90) if len(data) <= MAX_UPLOAD else None
+        except HTTPException:
+            return None
+    page = data.decode("utf-8", "replace")
+    for tag in OG_IMAGE.findall(page):
+        if found := CONTENT.search(tag):
+            if photo := _fetch_photo(urllib.parse.urljoin(final, html.unescape(found.group(1)))):
+                return photo
+    return None
+
+
 def _big_enough(jpeg: bytes) -> bool:
     """A product photo, not a colour swatch the AI picked by mistake."""
     return min(Image.open(io.BytesIO(jpeg)).size) >= 40
@@ -891,6 +930,111 @@ def _order_result(found: dict, photos: dict[int, bytes]) -> dict:
             thumb = "data:image/jpeg;base64," + base64.b64encode(_jpeg(jpeg, 240, 72)).decode()
         pieces.append({"info": p["info"], "photo_token": token, "thumb": thumb})
     return {"shop": found["shop"], "date": found["date"], "pieces": pieces}
+
+
+# MARK: - Inspiration: outfits from Instagram or Pinterest, and the style profile the AI writes from them
+
+def _inspiration(conn, user: dict, newest_first: bool = False) -> list[sqlite3.Row]:
+    order = "DESC" if newest_first else "ASC"
+    return conn.execute(f"SELECT * FROM inspiration WHERE user_id = ? ORDER BY added_at {order}, rowid {order}", (user["id"],)).fetchall()
+
+
+def _look_texts(user: dict) -> list[str]:
+    with db.connect() as conn:
+        return [json.loads(r["data"]).get("description", "") for r in _inspiration(conn, user)]
+
+
+@app.post("/api/inspiration")
+async def add_inspiration(user: AIUser, request: Request, shots: list[UploadFile] = File(None), url: str = Form("")):
+    """Screenshots of outfits (Instagram, Pinterest), or a link to a pin: the AI describes each outfit, cuts it out of
+    the screenshot and writes the style profile anew."""
+    raws = [await shot.read() for shot in shots or []]
+    url = url.strip()[:2000]
+    if len(raws) > MAX_SHOTS:
+        raise HTTPException(400, f"Kies hoogstens {MAX_SHOTS} screenshots.")
+    if not raws and not url:
+        raise HTTPException(400, "Kies screenshots of plak een link.")
+    if not raws and not url.startswith(("https://", "http://")):
+        raise HTTPException(400, "Dit lijkt geen link. Kopieer de link van de pin (Delen → Link kopiëren).")
+    url = re.sub(r"^http://", "https://", url)
+
+    async def work():
+        found = raws
+        if not found:
+            claude.report(step="Foto ophalen")
+            if not (photo := await asyncio.to_thread(_fetch_page_photo, url)):
+                raise HTTPException(400, "Op deze link vond ik geen foto. Bij Instagram lukt dat meestal niet: neem dan een screenshot.")
+            found = [photo]
+        originals = await asyncio.to_thread(lambda: [Image.open(io.BytesIO(_jpeg(raw, 3000, 90))) for raw in found])
+        return await _read_inspiration(user, originals, url if not raws else "")
+    return await _background(request, user, _analysis(user, "inspiratie", work()))
+
+
+async def _read_inspiration(user: dict, originals: list[Image.Image], url: str):
+    sent = await asyncio.to_thread(_shots_to_send, originals)
+    profile = auth.user_settings(user).get("style_profile") or ""
+    found = await claude.read_inspiration(user, sent, await asyncio.to_thread(_look_texts, user), profile)
+    added = await asyncio.to_thread(_keep_looks, user, found["looks"], originals, sent, url)
+    if added and found["profile"]:
+        auth.put_user_setting(user, "style_profile", found["profile"])
+    return {"added": added, "skipped": len(originals) - len(added), "style_profile": auth.user_settings(user).get("style_profile") or ""}
+
+
+def _keep_looks(user: dict, looks: list[dict], originals: list[Image.Image], sent: list, url: str) -> list[dict]:
+    """Each outfit with its photo: cut out of the screenshot where the AI says it is, else the whole picture."""
+    added, used = [], set()
+    for look in looks:
+        n = look["photo"]
+        if n in used:  # one outfit per picture
+            continue
+        used.add(n)
+        if look["box"]:
+            jpeg = _cut(originals, sent, n, look["box"])
+        else:
+            out = io.BytesIO()
+            originals[n - 1].save(out, "JPEG", quality=85)
+            jpeg = _jpeg(out.getvalue(), 1200, 80)
+        look_id = db.new_id()
+        (db.PHOTO_DIR / f"{look_id}.jpg").write_bytes(jpeg)
+        data = {k: look[k] for k in ("description", "colors", "style_tags", "pieces")}
+        if url:
+            data["url"] = url
+        with db.connect() as conn:
+            conn.execute("INSERT INTO inspiration (id, user_id, added_at, data) VALUES (?, ?, ?, ?)",
+                         (look_id, user["id"], db.now_iso(), json.dumps(data)))
+            added.append(db.inspiration_row(conn.execute("SELECT * FROM inspiration WHERE id = ?", (look_id,)).fetchone()))
+    return added
+
+
+@app.delete("/api/inspiration/{look_id}")
+def delete_inspiration(look_id: str, user: User):
+    """The outfit goes; the profile stays as it is until it is written anew (Opnieuw opmaken)."""
+    with db.connect() as conn:
+        if not conn.execute("DELETE FROM inspiration WHERE id = ? AND user_id = ?", (look_id, user["id"])).rowcount:
+            raise HTTPException(404, "Deze inspiratie bestaat niet meer.")
+    _remove_photo(look_id)
+    return {"ok": True}
+
+
+@app.post("/api/inspiration/profile")
+async def rewrite_style_profile(user: AIUser, request: Request):
+    """The style profile written anew from the outfits that are there now, e.g. after removing some."""
+    if not await asyncio.to_thread(_look_texts, user):
+        raise HTTPException(400, "Bewaar eerst een paar outfits die je mooi vindt.")
+
+    async def work():
+        found = await claude.read_inspiration(user, [], await asyncio.to_thread(_look_texts, user), "")
+        if found["profile"]:
+            auth.put_user_setting(user, "style_profile", found["profile"])
+        return {"style_profile": auth.user_settings(user).get("style_profile") or ""}
+    return await _background(request, user, _analysis(user, "inspiratie", work()))
+
+
+@app.put("/api/settings/style-profile")
+def set_style_profile(body: ProfileIn, user: User):
+    """The profile as the user corrected it; the next outfit that is added builds on this."""
+    auth.put_user_setting(user, "style_profile", body.profile.strip()[:1500] or None)
+    return {"style_profile": auth.user_settings(user).get("style_profile") or ""}
 
 
 # MARK: - The suitcase: one trip at a time, with where, when and what is packed
@@ -1015,7 +1159,7 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
         items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ?", (user["id"],))]
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ?", (user["id"],))]
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
-                                          packed=packed, weather_at=weather_at if use_weather and not on_trip else None)
+                                          style=settings.get("style_profile") or "", packed=packed, weather_at=weather_at if use_weather and not on_trip else None)
     return {**result, "weather": forecast, "elsewhere": elsewhere}
 
 
@@ -1091,12 +1235,14 @@ def _thumb(file: Path) -> Path:
 
 @app.get("/photos/{name}")
 def photo(name: str, user: User, w: int = 0):
-    """Photos are only served to the account they belong to. With w, the small copy for lists."""
+    """Photos (of a piece or of an inspiration) are only served to the account they belong to. With w, the small copy
+    for lists."""
     stem = name.removesuffix(".jpg")
     if not name.endswith(".jpg") or not SAFE_ID.fullmatch(stem):
         raise HTTPException(404, "Foto niet gevonden.")
     with db.connect() as conn:
-        ok = conn.execute("SELECT 1 FROM items WHERE id = ? AND user_id = ?", (stem, user["id"])).fetchone()
+        ok = conn.execute("SELECT 1 FROM items WHERE id = ? AND user_id = ? UNION ALL "
+                          "SELECT 1 FROM inspiration WHERE id = ? AND user_id = ?", (stem, user["id"], stem, user["id"])).fetchone()
     file = db.PHOTO_DIR / f"{stem}.jpg"
     if not ok or not file.exists():
         raise HTTPException(404, "Foto niet gevonden.")

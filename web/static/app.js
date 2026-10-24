@@ -605,7 +605,7 @@ function renderStylist() {
     ? `Kijkt naar ${packedItems().length ? "je valies" : "je dressing"} en het weer in ${h(tripName())}.` : `Kijkt naar je dressing${st.useWeather && S.place ? ", het weer" : ""} en wat je laatst droeg.`}</p></div>`;
   if (st.error) return `${top}<div class="notice err">${h(st.error)}</div>${suggestions()}`;
   if (st.result) return `${top}${outfitsHTML(st.result)}<div class="buttons"><button class="btn-secondary" data-act="stylist-reset">Nieuwe vraag</button></div>`;
-  return `${top}${suggestions()}`;
+  return `${top}${inspirationStrip()}${suggestions()}`;
 }
 
 function suggestions() {
@@ -652,6 +652,95 @@ async function askStylist(query) {
   } catch (e) { st.error = e.message; }
   st.loading = false;
   render();
+}
+
+// MARK: - Inspiration: outfits from Instagram or Pinterest, and the style the AI writes from them
+
+const looks = () => S.inspiration || [];
+const lookById = (id) => looks().find((l) => l.id === id);
+
+function inspirationStrip() {
+  const n = looks().length;
+  return `<button class="trip-strip" data-act="inspiration">✨ <span class="grow">${n ? `Je stijl uit ${plural(n, "outfit", "outfits")} die je mooi vindt gaat mee.`
+    : "Leer de stylist je smaak: bewaar outfits die je mooi vindt op Instagram of Pinterest."}</span><span aria-hidden="true">Inspiratie ›</span></button>`;
+}
+
+function lookTile(l) {
+  return `<button class="tile-item" data-act="open-look" data-id="${h(l.id)}"><img class="ph" src="${h(small(l.photo))}" alt="" loading="lazy">
+    <span class="txt"><span class="sub">${swatches(l)}${h((l.style_tags || []).slice(0, 3).join(", "))}</span></span></button>`;
+}
+
+function renderInspiration(page) {
+  const bar = `<div class="topbar"><button class="btn-plain" data-act="back">‹ Terug</button><span class="title">Inspiratie</span><span class="spacer"></span></div>`;
+  const list = looks(), ready = aiReady();
+  const adding = page.phase === "reading" ? `<div class="analyzing"><div class="spinner"></div><p><b>${h(page.step || "De AI bekijkt je outfits…")}</b></p>
+      <p class="muted small">Kleuren, silhouet en sfeer, en wat dat zegt over je stijl.</p></div>`
+    : `<div class="buttons" style="margin-top:0"><label class="btn-primary${ready ? "" : " disabled"}">📱 Screenshots kiezen
+        <input class="file-input" type="file" accept="image/*" multiple data-act-change="inspiration-shots" ${ready ? "" : "disabled"}></label></div>
+      <form class="card" style="margin-top:12px" data-act-submit="inspiration-link"><div class="field"><label for="i-url">Of plak de link van een pin</label>
+        <input id="i-url" name="url" type="url" inputmode="url" autocapitalize="off" spellcheck="false" placeholder="https://pin.it/…" value="${h(page.url || "")}" required></div>
+        <div class="auth-submit"><button class="btn-secondary" ${ready ? "" : "disabled"}>Foto ophalen</button></div></form>`;
+  const style = page.editing ? `<form class="card" data-act-submit="save-style"><div class="field"><label for="i-style">Je stijl</label>
+        <textarea id="i-style" name="profile" rows="6">${h(S.style_profile)}</textarea></div>
+        <div class="auth-submit"><button class="btn-primary">Bewaren</button></div></form>
+      <div class="buttons"><button class="btn-secondary" data-act="cancel-style">Annuleer</button></div>`
+    : S.style_profile ? `<div class="card pad" style="white-space:pre-line;line-height:1.45">${h(S.style_profile)}</div>
+      <div class="buttons"><button class="btn-secondary" data-act="edit-style">Aanpassen</button>
+        ${list.length && ready ? `<button class="btn-secondary" data-act="rewrite-style" ${page.phase === "reading" ? "disabled" : ""}>Opnieuw opmaken uit je outfits</button>` : ""}</div>`
+    : `<div class="card pad muted">Nog leeg. Bewaar een paar outfits, dan schrijft de AI hier je stijl.</div>`;
+  return `${bar}<h1 class="large">Inspiratie</h1>
+    <p class="subtitle">Outfits die je mooi vindt op Instagram of Pinterest. De AI haalt er je stijl uit, en de stylist kiest daarnaar uit je eigen kleren.</p>
+    ${!ready ? `<div class="notice">Zonder API-sleutel kan de AI geen outfits bekijken. Stel er een in bij Instellingen.</div>` : ""}
+    ${adding}
+    ${page.error ? `<div class="notice err">${h(page.error)}</div>` : ""}${page.note ? `<div class="notice ok">${h(page.note)}</div>` : ""}
+    <h2 class="section-title">Je stijl</h2>${style}
+    <p class="footnote">Gaat mee naar de stylist bij elke vraag, naast wat je bij Over jou schreef. Tik een outfit aan om het na te maken met je eigen kleren.</p>
+    ${list.length ? `<h2 class="section-title">${plural(list.length, "outfit", "outfits")}</h2><div class="grid">${list.map(lookTile).join("")}</div>` : ""}
+    <p class="footnote">Instagram: neem een screenshot van de post (tot 6 tegelijk); de AI knipt het outfit eruit. Pinterest: een screenshot,
+      of Delen → Link kopiëren en hier plakken.</p>`;
+}
+
+function openLook(id) {
+  const l = lookById(id);
+  if (!l) return;
+  const chips = (list) => (list?.length ? `<div class="chips" style="margin-top:12px">${list.map((x) => `<span class="chip">${h(x)}</span>`).join("")}</div>` : "");
+  openSheet(`<div class="topbar"><span class="spacer"></span><span class="title" id="sheet-title">Outfit</span><button class="btn-pill strong" data-act="close-sheet">Klaar</button></div>
+    <button class="hero-photo" data-act="view-photo" data-src="${h(l.photo)}" aria-label="Foto groot bekijken"><img src="${h(l.photo)}" alt=""></button>
+    <p style="margin:14px 4px 0;line-height:1.45">${h(l.description)}</p>${chips(l.pieces)}${chips(l.style_tags)}
+    ${l.url ? `<p class="footnote"><a href="${h(l.url)}" target="_blank" rel="noopener noreferrer">Bekijk de pin</a></p>` : ""}
+    <div class="buttons"><button class="btn-primary" data-act="copy-look" data-id="${h(l.id)}" ${aiReady() ? "" : "disabled"}>${ic("sparkle")} Maak na met mijn kleren</button></div>
+    <div class="card" style="margin-top:20px"><div class="row"><button class="row-button danger" data-act="delete-look" data-id="${h(l.id)}">Verwijderen uit Inspiratie</button></div></div>`);
+}
+
+async function addInspiration(page, shots = null, url = "") {
+  if (page.phase === "reading") return;
+  Object.assign(page, { phase: "reading", error: null, note: null, step: "", url });
+  render();
+  const form = new FormData();
+  if (shots) for (const shot of shots) form.append("shots", await smaller(shot, 2400), "screenshot.jpg");
+  else form.append("url", url);
+  try {
+    const r = await slowApi("/api/inspiration", { method: "POST", form },
+      (p) => { if (p.step && p.step !== page.step) { page.step = p.step; if (stack.at(-1) === page) render(); } });
+    if (!r.added.length) throw new Error(shots?.length > 1 ? "Op deze foto's zag de AI geen outfit." : "Op deze foto zag de AI geen outfit.");
+    page.url = "";
+    page.note = `${plural(r.added.length, "outfit", "outfits")} bewaard${r.skipped ? ` (op ${plural(r.skipped, "foto", "foto's")} stond geen outfit)` : ""}. Je stijl is bijgewerkt.`;
+    await load();
+  } catch (e) { page.error = e.message; }
+  page.phase = "idle";
+  if (stack.includes(page)) render();
+}
+
+async function rewriteStyle(page) {
+  if (page.phase === "reading") return;
+  Object.assign(page, { phase: "reading", error: null, note: null, step: "" });
+  render();
+  try {
+    S.style_profile = (await slowApi("/api/inspiration/profile", { method: "POST" })).style_profile;
+    page.note = "Je stijl is opnieuw opgemaakt.";
+  } catch (e) { page.error = e.message; }
+  page.phase = "idle";
+  if (stack.includes(page)) render();
 }
 
 // MARK: - Worn tab and the outfit page
@@ -738,6 +827,9 @@ function renderSettings() {
         <textarea id="s-profile" name="profile" rows="3" placeholder="bv. man, 38, werk in een creatief bureau; hou van smart casual in aardetinten; geen skinny jeans">${h(S.profile)}</textarea></div>
       <div class="auth-submit"><button class="btn-primary">Bewaren</button></div></form>
     <p class="footnote">Gaat mee naar de stylist bij elke vraag.</p>
+    <div class="card" style="margin-top:12px"><div class="row"><button class="row-button" data-act="inspiration">✨ Inspiratie van Instagram en Pinterest
+      <span class="muted small" style="display:block">${looks().length ? `${plural(looks().length, "outfit", "outfits")} · je stijl gaat mee naar de stylist` : "Bewaar outfits die je mooi vindt"}</span></button>
+      <span class="muted" aria-hidden="true">›</span></div></div>
     <h2 class="section-title">Weer</h2>
     <form class="card" data-act-submit="save-place">
       <div class="field"><label for="s-place">Woonplaats</label><input id="s-place" name="place" value="${h(S.place?.name || "")}" placeholder="bv. Kortrijk"></div>
@@ -776,7 +868,7 @@ function renderSettings() {
     <p class="footnote" style="margin-top:24px;text-align:center">Dressing${S.version ? ` · versie ${h(S.version)}` : ""}</p>`;
 }
 
-const TASKS = { herkennen: "Foto herkennen", bestelling: "Bestelling lezen", stylist: "Stylist" };
+const TASKS = { herkennen: "Foto herkennen", bestelling: "Bestelling lezen", stylist: "Stylist", inspiratie: "Inspiratie" };
 
 /** What the AI cost this year: an estimate from the tokens each answer reports, times the list price. */
 function costsSection() {
@@ -932,7 +1024,7 @@ function render() {
   if (!page) { pages.innerHTML = ""; document.body.style.overflow = ""; return; }
   const same = pages.firstElementChild?.dataset.key === String(page.key);
   const scroll = same ? pages.firstElementChild.scrollTop : 0;
-  const views = { detail: renderDetail, add: renderAdd, edit: renderEdit, outfit: renderOutfit, order: renderOrder, trip: renderTrip };
+  const views = { detail: renderDetail, add: renderAdd, edit: renderEdit, outfit: renderOutfit, order: renderOrder, trip: renderTrip, inspiration: renderInspiration };
   pages.innerHTML = `<div class="page${same ? "" : " enter"}" data-key="${page.key}"><div class="inner">${views[page.kind](page)}</div></div>`;
   pages.firstElementChild.scrollTop = scroll;
   pages.firstElementChild.addEventListener("scroll", (e) => updateBars(e.currentTarget), { passive: true });
@@ -942,7 +1034,7 @@ function render() {
 
 function pageTitle(page) {
   if (page.kind === "detail") return itemById(page.id)?.name || "Kledingstuk";
-  return { add: "Toevoegen", edit: "Bewerken", outfit: "Gedragen", order: "Uit een bestelmail", trip: "Valies" }[page.kind];
+  return { add: "Toevoegen", edit: "Bewerken", outfit: "Gedragen", order: "Uit een bestelmail", trip: "Valies", inspiration: "Inspiratie" }[page.kind];
 }
 
 let pageSeq = 0;
@@ -1063,6 +1155,20 @@ const actions = {
     if (!confirm(`Je reis naar ${tripName()} afsluiten en de valies leegmaken? De kleren blijven gewoon in je dressing.`)) return;
     if (await mutate(() => api("/api/trip", { method: "DELETE" }))) { ui.stylist.onTrip = null; ui.tripWeather = undefined; stack = []; render(); toast("Welkom thuis"); }
   },
+  inspiration: () => push({ kind: "inspiration", phase: "idle", url: "" }),
+  "open-look": (el) => openLook(el.dataset.id),
+  "copy-look": (el) => {
+    const l = lookById(el.dataset.id);
+    closeSheet(); stack = []; ui.tab = "stylist"; ui.stylist.onTrip = false;
+    askStylist(`Maak deze look na met mijn kleren: ${l.description}`);
+  },
+  async "delete-look"(el) {
+    if (!confirm("Dit outfit verwijderen uit Inspiratie? Je stijl blijft zoals hij is tot je hem opnieuw opmaakt.")) return;
+    if (await mutate(() => api(`/api/inspiration/${el.dataset.id}`, { method: "DELETE" }))) { closeSheet(); toast("Verwijderd"); }
+  },
+  "edit-style": () => { stack.at(-1).editing = true; render(); },
+  "cancel-style": () => { stack.at(-1).editing = false; render(); },
+  "rewrite-style": () => rewriteStyle(stack.at(-1)),
   "stylist-reset": () => { Object.assign(ui.stylist, { query: "", result: null, error: null }); render(); },
   async logout() { await api("/api/auth/logout", { method: "POST" }).catch(() => {}); signedOut(); },
   "password-sheet": () => passwordSheet({ title: "Wachtwoord wijzigen", submit: "change-password", current: true }),
@@ -1160,6 +1266,11 @@ const submits = {
   async "set-location"(form) {
     if (await mutate(() => api(`/api/items/${form.dataset.id}`, { method: "PATCH", json: { location: form.location.value } }))) { closeSheet(); toast("Plaats bewaard"); }
   },
+  "inspiration-link"(form) { addInspiration(stack.at(-1), null, form.url.value.trim()); },
+  async "save-style"(form) {
+    const page = stack.at(-1);
+    if (await mutate(() => api("/api/settings/style-profile", { method: "PUT", json: { profile: form.profile.value } }))) { page.editing = false; render(); toast("Bewaard"); }
+  },
   async "save-profile"(form) { if (await mutate(() => api("/api/settings/profile", { method: "PUT", json: { profile: form.profile.value } }))) toast("Bewaard"); },
   async "save-place"(form) {
     const r = await mutate(() => api("/api/settings/place", { method: "PUT", json: { place: form.place.value } }));
@@ -1228,6 +1339,11 @@ const changes = {
     const files = [...(el.files || [])];
     if (files.length > 6) { stack.at(-1).error = "Kies hoogstens 6 screenshots."; return render(); }
     if (files.length) readOrder(stack.at(-1), null, files);
+  },
+  "inspiration-shots": (el) => {
+    const files = [...(el.files || [])];
+    if (files.length > 6) { stack.at(-1).error = "Kies hoogstens 6 screenshots."; return render(); }
+    if (files.length) addInspiration(stack.at(-1), files);
   },
   "use-weather": (el) => { ui.stylist.useWeather = el.checked; },
 };

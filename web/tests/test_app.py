@@ -21,7 +21,7 @@ H = {"X-Dressing": "1"}
 def client(monkeypatch):
     db.init()
     with db.connect() as conn:
-        for table in ("worn", "items", "sessions", "login_failures", "audit_log", "ai_usage", "request_keys", "push_subscriptions", "users"):
+        for table in ("worn", "items", "inspiration", "sessions", "login_failures", "audit_log", "ai_usage", "request_keys", "push_subscriptions", "users"):
             conn.execute(f"DELETE FROM {table}")
     monkeypatch.setattr(main.keys, "active_key", lambda user, name="claude": ("sk-test", "env"))
     with TestClient(main.app) as c:
@@ -511,3 +511,108 @@ def test_outfit_question_goes_to_the_phone(client, monkeypatch):
     asyncio.run(push.send_questions(datetime.now(timezone.utc) + timedelta(days=1)))
     assert len(sent) == 1  # asked once
     assert client.delete(f"/api/push/devices/{push.device_id(sub['endpoint'])}", headers=H).json()["devices"] == []
+
+
+def shot_png() -> bytes:
+    """A phone screenshot with an outfit (navy) amid the app's white."""
+    shot = Image.new("RGB", (1170, 2532), "white")
+    shot.paste(Image.new("RGB", (400, 600), "navy"), (200, 400))
+    out = io.BytesIO()
+    shot.save(out, "PNG")
+    return out.getvalue()
+
+
+def test_inspiration_from_screenshots_makes_the_style_the_stylist_uses(client, monkeypatch):
+    seen = []
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        seen.append((tool["name"], "\n".join(c["text"] for c in content if c["type"] == "text")))
+        if tool["name"] == "geef_outfits":
+            return {"advies": "", "outfits": []}
+        scale = 725 / 1170  # the screenshot as the AI sees it
+        return {"looks": [{"foto": 1, "vak": [round(200 * scale), round(400 * scale), round(600 * scale), round(1000 * scale)],
+                           "beschrijving": "Marineblauwe wijde broek met wit hemd", "kleuren": ["marineblauw", "wit"], "stijl": ["minimalistisch"]},
+                          {"foto": 2, "geen_outfit": True}],
+                "profiel": "Rustige marine en wit, wijde silhouetten."}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    files = [("shots", ("a.png", shot_png(), "image/png")), ("shots", ("b.png", shot_png(), "image/png"))]
+    r = client.post("/api/inspiration", files=files, headers=H)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["skipped"] == 1 and body["style_profile"] == "Rustige marine en wit, wijde silhouetten."
+    look = body["added"][0]
+    assert look["colors"] == ["marineblauw", "wit"] and "url" not in look
+    photo = Image.open(db.PHOTO_DIR / f"{look['id']}.jpg")
+    assert abs(photo.width - 400) < 6 and abs(photo.height - 600) < 6  # the outfit cut out of the screenshot
+    assert client.get(look["photo"]).status_code == 200 and client.get(look["photo"] + "&w=1").status_code == 200
+    state = client.get("/api/state").json()
+    assert state["style_profile"] == body["style_profile"] and [l["id"] for l in state["inspiration"]] == [look["id"]]
+
+    # A second time, the earlier look and the profile go along to be built on.
+    client.post("/api/inspiration", files=files[:1], headers=H)
+    assert "Marineblauwe wijde broek met wit hemd" in seen[-1][1] and "Rustige marine en wit" in seen[-1][1]
+
+    add(client, name="Wit hemd")
+    client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    assert seen[-1][0] == "geef_outfits" and "Mijn stijl, uit outfits die ik mooi vind:\nRustige marine en wit" in seen[-1][1]
+
+    # Only for this account; and gone with its photo when removed.
+    client.post("/api/users", json={"username": "ander", "password": "geheim456"}, headers=H)
+    other = TestClient(main.app)
+    other.post("/api/auth/login", json={"username": "ander", "password": "geheim456"}, headers=H)
+    assert other.get(look["photo"]).status_code == 404 and other.get("/api/state").json()["inspiration"] == []
+    assert other.delete(f"/api/inspiration/{look['id']}", headers=H).status_code == 404
+    assert client.delete(f"/api/inspiration/{look['id']}", headers=H).status_code == 200
+    assert not (db.PHOTO_DIR / f"{look['id']}.jpg").exists()
+
+
+def test_inspiration_from_a_pinterest_link(client, monkeypatch):
+    fetched = []
+    monkeypatch.setattr(main, "_fetch_page_photo", lambda url: fetched.append(url) or jpeg())
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        return {"looks": [{"foto": 1, "beschrijving": "Camel jas over grijze trui"}], "profiel": "Warme neutrale tinten."}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    r = client.post("/api/inspiration", data={"url": " http://pin.it/abc "}, headers=H)
+    assert r.status_code == 200, r.text
+    assert fetched == ["https://pin.it/abc"] and r.json()["added"][0]["url"] == "https://pin.it/abc"
+    assert client.post("/api/inspiration", data={"url": "geen link"}, headers=H).status_code == 400
+    monkeypatch.setattr(main, "_fetch_page_photo", lambda url: None)
+    r = client.post("/api/inspiration", data={"url": "https://www.instagram.com/p/xyz/"}, headers=H)
+    assert r.status_code == 400 and "screenshot" in r.json()["detail"]
+
+
+def test_page_photo_comes_from_its_preview_picture(monkeypatch):
+    page = b'<html><head><meta content="https://i.pinimg.com/736x/a.jpg" property="og:image"></head></html>'
+
+    class Resp(io.BytesIO):
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        def geturl(self):
+            return "https://www.pinterest.com/pin/1/"
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+    monkeypatch.setattr(main, "_public_host", lambda url: True)
+    monkeypatch.setattr(main._opener, "open", lambda req, timeout: Resp(page))
+    asked = []
+    monkeypatch.setattr(main, "_fetch_photo", lambda url: asked.append(url) or b"jpeg")
+    assert main._fetch_page_photo("https://pin.it/abc") == b"jpeg" and asked == ["https://i.pinimg.com/736x/a.jpg"]
+    monkeypatch.setattr(main, "_public_host", lambda url: False)
+    assert main._fetch_page_photo("https://192.168.1.1/") is None
+
+
+def test_style_profile_rewritten_and_edited(client, monkeypatch):
+    assert client.post("/api/inspiration/profile", headers=H).status_code == 400  # nothing to write it from yet
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        seen["text"] = content[-1]["text"]
+        return {"looks": [{"foto": 1, "beschrijving": "Zwarte jurk met sneakers"}] if len(content) > 1 else [],
+                "profiel": "Zwart, sportief-chic."}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    client.post("/api/inspiration", files=[("shots", ("a.png", shot_png(), "image/png"))], headers=H)
+    r = client.post("/api/inspiration/profile", headers=H)
+    assert r.json()["style_profile"] == "Zwart, sportief-chic." and "Geen nieuwe foto's" in seen["text"]
+    r = client.put("/api/settings/style-profile", json={"profile": " Liever geen zwart. "}, headers=H)
+    assert r.json()["style_profile"] == "Liever geen zwart."

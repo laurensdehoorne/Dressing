@@ -29,7 +29,8 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   - het **weer** van vandaag en morgen in je woonplaats (Open-Meteo, gratis en zonder sleutel; uit te zetten per vraag),
   - wat je **laatst droeg** (afwisselen, en stukken die lang niet gedragen zijn eens bovenhalen),
   - je **scores en notities** bij eerdere outfits,
-  - wat je bij **Instellingen → Over jou** over je stijl schreef.
+  - wat je bij **Instellingen → Over jou** over je stijl schreef,
+  - je **stijl uit Inspiratie** (zie hieronder).
   Ontbreekt er iets wezenlijks (een regenjas, nette schoenen), dan zegt hij dat als koopadvies.
 - **Valies**: zeg waar en wanneer je op reis gaat en tik aan wat je meeneemt (of laat de stylist helpen inpakken en leg
   een voorgestelde outfit met één tik in de valies). Bij **Wat aantrekken?** kies je dan *Thuis* of de reis: op reis kiest
@@ -39,6 +40,11 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
 - **Gedragen**: noteer wat je droeg (vanuit een voorstel, bij een stuk of zelf samengesteld), met datum,
   gelegenheid, sterren en notitie. Bij elk stuk zie je hoe vaak en wanneer het laatst gedragen werd.
 - **Outfit rond dit stuk**: vanuit een kledingstuk meteen een outfit eromheen vragen.
+- **Inspiratie**: bewaar outfits die je mooi vindt op Instagram of Pinterest, met tot 6 screenshots tegelijk of de link van
+  een pin (de server haalt de foto van de pin op; bij Instagram lukt dat zonder aanmelden niet, daar neem je een screenshot). De
+  AI knipt het outfit uit de screenshot, beschrijft het en schrijft uit al je outfits samen een **stijlprofiel** (kleuren,
+  silhouetten, sfeer) dat je kan aanpassen. De stylist kiest in die geest, en met **Maak na met mijn kleren** benadert hij een
+  bewaard outfit met wat je hebt en zegt hij welk stuk de look zou afmaken. Te vinden bij **Wat aantrekken?** en bij Instellingen.
 - **Accounts**: zoals de Wijnkelder. De eerste gebruiker wordt beheerder en maakt andere accounts aan; elk account
   ziet enkel zijn eigen kleren. Een rem op foute wachtwoorden en een log van aanmeldingen.
 - **Claude of ChatGPT**, te kiezen per account bij **Instellingen → AI-dienst**. Je kan voor beide een sleutel

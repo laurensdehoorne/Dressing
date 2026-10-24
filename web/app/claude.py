@@ -290,6 +290,42 @@ async def read_order(user: dict, text: str, photos: dict[int, bytes], shots: lis
     return {"shop": shop, "date": day, "pieces": pieces}
 
 
+# MARK: - Inspiration: outfits the user likes, and the style they add up to
+
+MAX_LOOKS = 60  # the descriptions of earlier looks that go along to write the profile; the newest count
+
+
+def _look(got: dict, shots: list[tuple[bytes, tuple[int, int]]]) -> dict | None:
+    try:
+        n = int(got.get("foto") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= n <= len(shots) or got.get("geen_outfit") or not str(got.get("beschrijving") or "").strip():
+        return None
+    return {"photo": n, "box": _box(got.get("vak"), shots[n - 1][1]),
+            "description": str(got["beschrijving"]).strip()[:600],
+            "colors": db._words(got.get("kleuren"), 8), "style_tags": db._words(got.get("stijl"), 8),
+            "pieces": db._words(got.get("stukken"), 10)}
+
+
+async def read_inspiration(user: dict, shots: list[tuple[bytes, tuple[int, int]]], looks: list[str], profile: str) -> dict:
+    """What each picture of an outfit the user likes shows (and where on a screenshot the outfit is, to cut it out),
+    and the style profile written anew from these and the earlier looks. Without pictures only the profile."""
+    content: list = []
+    for n, (jpeg, (w, h)) in enumerate(shots, 1):
+        content += [{"type": "text", "text": f"[foto {n}: {w}×{h} pixels]"}, _image(jpeg)]
+    question = (f"Mijn stijlprofiel tot nu toe:\n{profile}" if profile else "Er is nog geen stijlprofiel.")
+    if looks:
+        question += "\n\nOutfits die ik eerder bewaarde:\n" + "\n".join(f"- {look}" for look in looks[-MAX_LOOKS:])
+    question += ("\n\nBeschrijf de outfits op de nieuwe foto's hierboven en schrijf het stijlprofiel opnieuw." if shots
+                 else "\n\nGeen nieuwe foto's: schrijf het stijlprofiel opnieuw uit de outfits hierboven; looks is leeg.")
+    content.append({"type": "text", "text": question})
+    report(step="Outfits bekijken" if shots else "Stijlprofiel opmaken")
+    got = await _timed(_ask(user, INSPIRATION_TOOL, system=INSPIRATION_SYSTEM, content=content, helper=thrifty(user)))
+    found = [look for g in got.get("looks") or [] if isinstance(g, dict) and (look := _look(g, shots))]
+    return {"looks": found, "profile": str(got.get("profiel") or "").strip()[:1500]}
+
+
 # MARK: - The stylist
 
 def _item_line(item: dict, wear: dict) -> str:
@@ -319,10 +355,11 @@ def _item_line(item: dict, wear: dict) -> str:
 
 
 async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[dict], *, weather: str = "",
-                          profile: str = "", packed: list[str] | None = None,
+                          profile: str = "", style: str = "", packed: list[str] | None = None,
                           weather_at: Callable[[dict], Awaitable[str]] | None = None) -> dict:
     """1 to 3 outfits from the pieces in the dressing for this question (an occasion, the weather, a mood); on a trip
-    (packed: what is in the suitcase) only from the suitcase. With weather_at the stylist can look up the weather of
+    (packed: what is in the suitcase) only from the suitcase. style: the profile the AI wrote from outfits the user
+    likes (Inspiratie). With weather_at the stylist can look up the weather of
     another place or a later day the question is about (an outing to Amsterdam, Saturday)."""
     wear: dict[str, dict] = {}
     for log in sorted(worn, key=lambda l: l["date"]):
@@ -353,6 +390,8 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         taste.append(line)
     where = "Mijn valies: ik ben op reis en heb enkel dit bij me" if packed is not None else "Mijn dressing"
     wardrobe = f"{where} (één stuk per regel, id vooraan):\n" + "\n".join(_item_line(i, wear) for i in available)
+    if style:
+        wardrobe = f"Mijn stijl, uit outfits die ik mooi vind:\n{style}\n\n{wardrobe}"
     if profile:
         wardrobe = f"Over mij: {profile}\n\n{wardrobe}"
     if taste:
@@ -457,6 +496,38 @@ ORDER_TOOL = {
     },
 }
 
+INSPIRATION_SYSTEM = """Je helpt iemand zijn of haar smaak in kleding onder woorden te brengen. Je krijgt foto's van outfits die die persoon mooi vindt: screenshots van Instagram of Pinterest, of de foto van een pin. Elke foto heeft een nummer [foto N] en zijn grootte in pixels.
+
+Roep precies één keer de tool bewaar_inspiratie aan. Regels:
+- looks: één per foto met een outfit (foto is het nummer N). Staan er op één screenshot meerdere outfits, kies het outfit dat het meest in beeld staat. Staat er geen outfit op (enkel tekst, een product zonder persoon of styling, iets anders), zet geen_outfit op true.
+- vak: bij een screenshot de rechthoek rond het outfit als [links, boven, rechts, onder] in pixels van die foto, zonder de knoppen, tekst en balken van de app eromheen. Is de foto zelf al het outfit, laat vak weg.
+- beschrijving: 1 à 2 zinnen over het outfit zoals een stylist het zou samenvatten, met de stukken, kleuren, silhouet en sfeer (bv. "Wijde ecru linnen broek met een strak zwart topje en platte sandalen; ontspannen en minimalistisch"). Geen merken die je niet kan lezen, niets over het gezicht of lichaam van de persoon.
+- kleuren: gewone Nederlandse kleurnamen, de hoofdkleur eerst. stijl: 2 tot 5 korte stijltermen. stukken: de kledingstukken in gewone woorden (bv. "wijde linnen broek", "zwart topje").
+- profiel: het stijlprofiel opnieuw geschreven uit alle outfits samen (de nieuwe en de eerdere), zodat een stylist er outfits mee kan kiezen uit iemands eigen kleerkast. 3 tot 6 korte zinnen of puntjes: kleuren en tinten, silhouetten en pasvormen, materialen, typische combinaties, de sfeer, en wat er nooit in voorkomt. Herhalingen tellen zwaarder dan één uitschieter. Een bestaand profiel neem je mee en vul je aan; spreekt het de foto's tegen, dan gaan de foto's voor.
+- Schrijf in het Nederlands (Vlaams), kort en concreet."""
+
+INSPIRATION_TOOL = {
+    "name": "bewaar_inspiratie",
+    "description": "Bewaar wat elke foto van een outfit laat zien, en het stijlprofiel dat eruit volgt.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "looks": {"type": "array", "items": {"type": "object", "properties": {
+                "foto": {"type": "integer", "description": "Het nummer N van de foto"},
+                "geen_outfit": {"type": "boolean", "description": "true als er geen outfit op de foto staat"},
+                "vak": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4,
+                        "description": "[links, boven, rechts, onder] van het outfit, in pixels van de foto"},
+                "beschrijving": {"type": "string"},
+                "kleuren": {"type": "array", "items": {"type": "string"}},
+                "stijl": {"type": "array", "items": {"type": "string"}},
+                "stukken": {"type": "array", "items": {"type": "string"}},
+            }, "required": ["foto"]}},
+            "profiel": {"type": "string", "description": "Het stijlprofiel, 3 tot 6 korte zinnen of puntjes"},
+        },
+        "required": ["looks", "profiel"],
+    },
+}
+
 STYLIST_SYSTEM = """Je bent de persoonlijke stylist van iemand en stelt outfits samen uitsluitend met kleren uit zijn of haar eigen dressing. De gebruiker beschrijft een gelegenheid, het weer, een stemming of een stuk dat erin moet. Stel 1 tot 3 outfits voor, de beste eerst, en roep precies één keer de tool geef_outfits aan. Gebruik enkel id's uit de lijst.
 
 Een outfit is compleet en draagbaar:
@@ -469,6 +540,7 @@ Kies zoals een stylist dat doet:
 - Kleuren die samengaan: neutrale basis (marine, grijs, beige, zwart, wit, ecru) met hoogstens één of twee accentkleuren; patronen hoogstens één opvallend stuk, tenzij ze bewust combineren. Materialen en stijl in dezelfde lijn.
 - Laat stukken die al lang niet of nog nooit gedragen zijn eens aan bod komen als ze goed passen, en wissel af met wat de laatste dagen al gedragen werd. Favorieten mogen vaker.
 - Wat de gebruiker eerder droeg en hoe het viel (score op 5, notitie), telt mee om te kiezen tussen outfits die al goed passen.
+- Staat er een stijl uit outfits die de gebruiker mooi vindt, kies dan in die geest: dezelfde kleuren, silhouetten en combinaties waar de dressing dat toelaat. Het is smaak, geen filter: het weer en de gelegenheid gaan voor. Vraagt de gebruiker een look na te maken, benader die zo dicht mogelijk met eigen kleren en zeg in ontbreekt welk stuk de look echt zou afmaken.
 
 Harde voorwaarden in de vraag (een kleur, een bepaald stuk, 'geen jeans', 'iets in het rood') zijn een filter, geen voorkeur. Ontbreekt er iets wezenlijks in de dressing voor deze vraag (bv. geen regenjas, geen nette schoenen), zeg dat kort in ontbreekt; dat is een tip om te kopen. Liever één goed outfit dan drie halve.
 

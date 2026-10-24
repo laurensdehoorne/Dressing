@@ -90,6 +90,14 @@ def init() -> None:
                 data TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS worn_user ON worn (user_id, date);
+            -- An outfit the user likes (a screenshot from Instagram, a pin from Pinterest), with what the AI saw in it.
+            CREATE TABLE IF NOT EXISTS inspiration (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                added_at TEXT NOT NULL,
+                data TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS inspiration_user ON inspiration (user_id, added_at);
             CREATE TABLE IF NOT EXISTS audit_log (
                 id TEXT PRIMARY KEY, at TEXT NOT NULL, event TEXT NOT NULL, username TEXT NOT NULL DEFAULT '',
                 user_id TEXT, ip TEXT NOT NULL DEFAULT '', via TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT ''
@@ -153,6 +161,10 @@ def item_row(row: sqlite3.Row) -> dict:
 
 def worn_row(row: sqlite3.Row) -> dict:
     return {**json.loads(row["data"]), "id": row["id"], "date": row["date"]}
+
+
+def inspiration_row(row: sqlite3.Row) -> dict:
+    return {**json.loads(row["data"]), "id": row["id"], "added_at": row["added_at"], "photo": _photo_url(f"{row['id']}.jpg")}
 
 
 def _level(value) -> int | None:

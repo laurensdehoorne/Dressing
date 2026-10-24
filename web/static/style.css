@@ -359,4 +359,4 @@ dialog.viewer .close { position: absolute; top: calc(var(--safe-top) + 12px); ri
 .trip-strip > span[aria-hidden] { color: var(--accent); font-weight: 600; white-space: nowrap; }
 .outfit .foot { display: flex; gap: 10px; }
 .outfit .foot > * { flex: 1; }
-label.btn-secondary.disabled { opacity: 0.5; pointer-events: none; }
+label.btn-secondary.disabled, label.btn-primary.disabled { opacity: 0.5; pointer-events: none; }
