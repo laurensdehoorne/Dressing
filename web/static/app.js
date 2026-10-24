@@ -306,14 +306,16 @@ const locationList = () => `<datalist id="locations">${locations().map((l) => `<
 const newDraft = () => ({ name: "", category: "top", colors: [], seasons: [], occasions: [], style_tags: [], status: "dressing", location: ui.lastLocation || "" });
 
 function renderAdd(page) {
-  const bar = `<div class="topbar"><button class="btn-plain" data-act="back">Annuleer</button><span class="title">Kledingstuk toevoegen</span><span class="spacer"></span></div>`;
+  const batch = page.batch, title = batch ? `Stuk ${page.batchAt + 1} van ${batch.length}` : "Kledingstuk toevoegen";
+  const bar = `<div class="topbar"><button class="btn-plain" data-act="back">${page.batchSaved ? "Stop" : "Annuleer"}</button><span class="title">${title}</span><span class="spacer"></span>
+    ${batch && page.phase === "review" ? `<button class="btn-plain" data-act="skip-piece" ${page.saving ? "disabled" : ""}>Sla over</button>` : ""}</div>`;
   if (page.phase === "analyzing") return `${bar}<div class="analyzing">${page.preview ? `<img src="${h(page.preview)}" alt="">` : ""}
       <div class="spinner"></div><p><b>De AI bekijkt je kledingstuk…</b></p><p class="muted small">Soort, kleur, stof, seizoen en stijl. Meestal een tiental seconden.</p></div>`;
   if (page.phase === "review") return `${bar}${itemForm(page, "save-new")}`;
   return `${bar}
     ${!aiReady() ? `<div class="notice">Zonder API-sleutel kan de AI niets herkennen. Stel er een in bij Instellingen, of vul het kledingstuk zelf in.</div>` : ""}
-    <label class="pick-photo" style="margin-top:12px">${ic("camera")}<b>Foto nemen of kiezen</b><span>Eén kledingstuk per foto, liefst op een hanger of plat gelegd bij goed licht.</span>
-      <input class="file-input" type="file" accept="image/*" data-act-change="photo-chosen"></label>
+    <label class="pick-photo" style="margin-top:12px">${ic("camera")}<b>Foto's nemen of kiezen</b><span>Eén kledingstuk per foto, liefst op een hanger of plat gelegd bij goed licht. Kies er gerust meerdere tegelijk.</span>
+      <input class="file-input" type="file" accept="image/*" multiple data-act-change="photo-chosen"></label>
     <div class="card" style="margin-top:12px"><div class="field"><label for="hint">Wat extra uitleg (mag leeg)</label>
       <input id="hint" data-bind-page="hint" value="${h(page.hint || "")}" placeholder="bv. merk Zara, maat M, gekregen van mama"></div></div>
     ${page.error ? `<div class="notice err">${h(page.error)}</div>` : ""}
@@ -1166,6 +1168,7 @@ const actions = {
   "save-order": () => saveOrder(stack.at(-1)),
   manual: () => { const p = stack.at(-1); Object.assign(p, { phase: "review", draft: newDraft(), error: null }); render(); },
   async "identify-text"() { await identify(stack.at(-1), null); },
+  "skip-piece": () => nextBatchPiece(stack.at(-1)),
   edit: (el) => { const i = itemById(el.dataset.id); push({ kind: "edit", id: i.id, draft: structuredClone(i) }); },
   "toggle-chip": (el) => {
     const d = stack.at(-1).draft, f = el.dataset.field, list = d[f] || [];
@@ -1322,20 +1325,60 @@ const actions = {
   },
 };
 
+/** What the AI makes of a photo and/or the hint, as fields for the add page. */
+async function recognize(file, hint) {
+  if (!aiReady()) return { phase: "review", draft: newDraft(), file };
+  const form = new FormData();
+  if (file) form.append("photo", await smaller(file), "foto.jpg");
+  form.append("hint", hint || "");
+  try {
+    const r = await slowApi("/api/identify", { method: "POST", form });
+    return { phase: "review", draft: { ...newDraft(), ...r.info }, photoToken: r.photo_token, recognized: true };
+  } catch (e) {
+    // The photo goes along with a piece filled in by hand: keep it as preview only (it is uploaded after saving).
+    return { phase: file ? "review" : "pick", draft: newDraft(), error: e.message, file };
+  }
+}
+
 async function identify(page, file) {
   Object.assign(page, { phase: "analyzing", error: null, preview: file ? URL.createObjectURL(file) : null });
   render();
-  const form = new FormData();
-  if (file) form.append("photo", await smaller(file), "foto.jpg");
-  form.append("hint", page.hint || "");
-  try {
-    const r = await slowApi("/api/identify", { method: "POST", form });
-    Object.assign(page, { phase: "review", draft: { ...newDraft(), ...r.info }, photoToken: r.photo_token, recognized: true });
-  } catch (e) {
-    // The photo goes along with a piece filled in by hand: keep it as preview only (it is uploaded after saving).
-    Object.assign(page, { phase: file ? "review" : "pick", draft: newDraft(), error: e.message, file });
-  }
+  Object.assign(page, await recognize(file, page.hint));
   if (stack.includes(page)) render();
+}
+
+const MAX_BATCH = 20;
+
+/** Several photos, one piece each: the AI reads them one after the other in the background, while you check them in order. */
+function identifyBatch(page, files) {
+  let previous = Promise.resolve();
+  page.batch = files.map((file) => {
+    const result = previous.then(() => stack.includes(page) ? recognize(file, page.hint) : null); // stopped: no more AI
+    previous = result;
+    return { file, preview: URL.createObjectURL(file), result };
+  });
+  Object.assign(page, { batchAt: 0, batchSaved: 0 });
+  showBatchPiece(page);
+}
+
+async function showBatchPiece(page) {
+  const at = page.batchAt, piece = page.batch[at];
+  Object.assign(page, { phase: "analyzing", error: null, preview: piece.preview, draft: null, photoToken: null, file: null, recognized: false, requestId: null, saving: false });
+  render(); scrollTo(0, 0);
+  const found = await piece.result;
+  if (!found || page.batchAt !== at || !stack.includes(page)) return;
+  Object.assign(page, found);
+  page.draft.location ||= ui.lastLocation || ""; // read before the previous pieces were saved
+  render();
+}
+
+/** On to the next photo, or done: back to the dressing with what was added. */
+function nextBatchPiece(page) {
+  if (page.batchAt < page.batch.length - 1) { page.batchAt++; return showBatchPiece(page); }
+  const added = page.batchSaved;
+  stack = []; ui.tab = "dressing"; ui.category = ""; ui.search = ""; ui.sort = "added";
+  render(); scrollTo(0, 0);
+  toast(added ? `${plural(added, "stuk", "stukken")} toegevoegd aan je dressing` : "Niets toegevoegd");
 }
 
 const submits = {
@@ -1414,14 +1457,21 @@ async function saveItem(page, isNew) {
     }
     if (data.location) ui.lastLocation = data.location; // the next piece probably hangs in the same place
     await load();
-    stack = isNew ? [{ key: ++pageSeq, kind: "detail", id: item.id }] : stack.slice(0, -1);
+    if (isNew && page.batch) { page.batchSaved++; return nextBatchPiece(page); }
+    stack =isNew ? [{ key: ++pageSeq, kind: "detail", id: item.id }] : stack.slice(0, -1);
     render();
     toast(isNew ? "Toegevoegd aan je dressing" : "Bewaard", isNew ? { label: "Nog een", run: () => actions.add() } : null);
   } catch (e) { page.error = e.message; page.saving = false; render(); }
 }
 
 const changes = {
-  "photo-chosen": (el) => { const file = el.files?.[0]; if (file) { const page = stack.at(-1); aiReady() ? identify(page, file) : Object.assign(page, { phase: "review", draft: newDraft(), file, preview: URL.createObjectURL(file) }) && render(); } },
+  "photo-chosen": (el) => {
+    const files = [...(el.files || [])], page = stack.at(-1);
+    if (files.length > MAX_BATCH) { page.error = `Kies hoogstens ${MAX_BATCH} foto's tegelijk.`; return render(); }
+    if (files.length > 1) return identifyBatch(page, files);
+    const file = files[0];
+    if (file) aiReady() ? identify(page, file) : Object.assign(page, { phase: "review", draft: newDraft(), file, preview: URL.createObjectURL(file) }) && render();
+  },
   async "replace-photo"(el) {
     const file = el.files?.[0], page = stack.at(-1);
     if (!file) return;
