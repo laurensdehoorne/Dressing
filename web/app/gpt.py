@@ -11,10 +11,11 @@ import re
 
 import openai
 
-from . import auth, keys
+from . import auth, costs, keys
 from .claude import TOO_SLOW, ClaudeError, Helpers, run_helper
 
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
+HELPER_MODEL = os.environ.get("OPENAI_HELPER_MODEL", "gpt-6-luna")  # the cheap model of "Zuinig"
 _clients: dict[str, openai.AsyncOpenAI] = {}
 _no_reasoning: set[str] = set()  # models that rejected the reasoning (effort) setting
 _no_breakpoints: set[str] = set()  # models before gpt-5.6, which reject cache breakpoints
@@ -172,10 +173,11 @@ def _function(tool: dict) -> dict:
             "parameters": tool["input_schema"], "strict": False}
 
 
-async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: list, effort: str, helpers: Helpers) -> dict:
-    """Asks until the model calls the tool's function, then returns that call's arguments (as claude._ask); a helper it
-    calls on the way is answered and the conversation goes on."""
-    name, tool_name = model(user), tool["name"]
+async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: list, effort: str, helpers: Helpers,
+                              name: str) -> dict:
+    """Asks model `name` until it calls the tool's function, then returns that call's arguments (as claude._ask); a
+    helper it calls on the way is answered and the conversation goes on."""
+    tool_name = tool["name"]
     # Cached up to the end of the fixed instructions, and wherever claude.py caches (the dressing). Top-level
     # `instructions` can't hold a breakpoint, so they go in as a developer message.
     fixed = {"role": "developer", "content": [{"type": "input_text", "text": system, "prompt_cache_breakpoint": CACHED}]}
@@ -190,6 +192,7 @@ async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: l
             raise
         except openai.OpenAIError as e:
             raise _error(e)
+        costs.track_openai(name, response)
         if (found := _function_input(response, tool_name)) is not None:
             return found
         calls = [i for i in response.output or [] if getattr(i, "type", None) == "function_call" and i.name in helpers]

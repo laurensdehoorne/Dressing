@@ -52,11 +52,26 @@ const shortDate = (day) => new Date(`${day}T12:00:00`).toLocaleDateString("nl-BE
 const swatchColor = (name) => COLORS[fold(name).replace(/\s+/g, "")] || COLORS[fold(name).split(/[\s-]/).pop()] || "#b8b0ba";
 const swatches = (i) => (i.colors?.length ? `<span class="swatches" aria-hidden="true">${i.colors.slice(0, 3).map((c) => `<span class="swatch" style="--c:${swatchColor(c)}"></span>`).join("")}</span>` : "");
 const listText = (v) => (Array.isArray(v) ? v.join(", ") : v || "");
+/** An id for one save: sent again on a retry, so the server bewaart it once (a second tap, an answer that got lost). */
+const requestId = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+/** An estimated cost in euros: tenths of a cent are shown for the small amounts one analysis costs. */
+const euros = (v) => (v > 0 && v < 0.0005 ? "< € 0,001"
+  : `€ ${(v || 0).toLocaleString("nl-BE", { minimumFractionDigits: v && v < 0.1 ? 3 : 2, maximumFractionDigits: v && v < 0.1 ? 3 : 2 })}`);
 
-/** How often and when a piece was worn, from the outfits in Gedragen. */
+/** How often and when a piece was worn, from the outfits in Gedragen. Counted once per render for all pieces
+    (render() starts over), not per piece: sorting asks it for every comparison. */
+let wearTable = null;
 function wearOf(id) {
-  const logs = S.worn.filter((l) => (l.item_ids || []).includes(id));
-  return { count: logs.length, last: logs.map((l) => l.date).sort().at(-1) || null };
+  if (!wearTable) {
+    wearTable = new Map();
+    for (const l of S.worn) for (const i of new Set(l.item_ids || [])) {
+      const w = wearTable.get(i) || { count: 0, last: null };
+      w.count += 1;
+      if (!w.last || l.date > w.last) w.last = l.date;
+      wearTable.set(i, w);
+    }
+  }
+  return wearTable.get(id) || { count: 0, last: null };
 }
 function daysAgo(day) {
   const n = Math.round((new Date(`${today()}T12:00:00`) - new Date(`${day}T12:00:00`)) / 864e5);
@@ -111,7 +126,7 @@ function signedOut() {
   ui.auth = { setup_needed: false, user: null };
   S = { items: [], worn: [], categories: [], statuses: [] };
   stack = [];
-  ui.users = null; ui.models = null; ui.weather = undefined;
+  ui.users = null; ui.models = null; ui.weather = undefined; ui.push = null;
   ui.stylist = { query: "", loading: false, result: null, error: null, useWeather: true, step: "", onTrip: null };
   ui.tripWeather = undefined;
   if ($("#sheet").open) closeSheet();
@@ -211,13 +226,18 @@ function renderDressing() {
     <div class="empty"><div class="icon">${ic("hanger")}</div><h2>Je dressing is nog leeg</h2>
       <p>Neem een foto van een kledingstuk: de AI ziet wat het is, welke kleur en stof, en jij zegt waar het hangt.</p>
       <button class="btn-primary empty-action" data-act="add">${ic("camera")} Eerste kledingstuk toevoegen</button></div>`;
-  const list = filteredItems();
   const here = S.items.filter((i) => !away(i)).length;
   return `<h1 class="large">Dressing</h1>
     <div class="summary"><b>${S.items.length}</b> ${S.items.length === 1 ? "stuk" : "stukken"}${here < S.items.length ? ` · ${here} in de dressing` : ""}</div>
     <label class="search"><span aria-hidden="true">🔍</span><input type="search" placeholder="Zoek op naam, kleur, merk, plaats…" value="${h(ui.search)}" data-bind-ui="search" aria-label="Zoeken"></label>
     ${categoryPills(S.items, ui.category, "category")}
-    ${list.length ? `<div class="grid">${list.map((i) => itemTile(i)).join("")}</div>` : `<div class="empty"><p>Niets gevonden.</p></div>`}`;
+    <div id="dressing-results">${dressingResults()}</div>`;
+}
+
+/** The pieces that match the search: typing in the search box only redraws these. */
+function dressingResults() {
+  const list = filteredItems();
+  return list.length ? `<div class="grid">${list.map((i) => itemTile(i)).join("")}</div>` : `<div class="empty"><p>Niets gevonden.</p></div>`;
 }
 
 function openSort() {
@@ -403,7 +423,8 @@ async function saveOrder(page) {
   try {
     for (const p of page.pieces) {
       if (!p.on || p.saved) continue;
-      await api("/api/items", { method: "POST", json: { data: draftOut(p.draft), photo_token: p.token || "" } });
+      p.requestId ||= requestId();
+      await api("/api/items", { method: "POST", json: { data: draftOut(p.draft), photo_token: p.token || "", request_id: p.requestId } });
       p.saved = true; p.on = false; added++;
     }
   } catch (e) { page.error = `${e.message}${added ? ` (${plural(added, "stuk", "stukken")} wel toegevoegd)` : ""}`; }
@@ -613,7 +634,8 @@ function outfitsHTML(r) {
       <div class="foot">${r.trip && o.item_ids.some((id) => !packed(id)) ? `<button class="btn-secondary" data-act="pack-outfit" data-n="${n}">🧳 In de valies</button>` : ""}
         <button class="btn-primary" data-act="wear-outfit" data-n="${n}">Dit draag ik</button></div></article>`).join("")}
     ${!r.outfits.length ? `<div class="notice">Geen outfit gevonden die past.</div>` : ""}
-    ${r.missing ? `<div class="notice">🛍️ ${h(r.missing)}</div>` : ""}`;
+    ${r.missing ? `<div class="notice">🛍️ ${h(r.missing)}</div>` : ""}
+    ${r.analysis ? `<p class="footnote" style="text-align:center">Dit antwoord kostte ${r.analysis.status === "estimated" ? "ongeveer" : "minstens"} ${euros(r.analysis.cost_eur)}.</p>` : ""}`;
 }
 
 async function askStylist(query) {
@@ -734,9 +756,16 @@ function renderSettings() {
       <div class="row"><span class="grow">Model</span><span class="v">${h(service.model)}</span></div>
       ${aiReady() ? `<div class="row"><button class="row-button" data-act="pick-model">Ander model kiezen</button></div>` : ""}
     </div>
+    <div class="pills" role="group" aria-label="Analyse" style="margin:14px 0 0">
+      ${[["standaard", "Standaard"], ["zuinig", "Zuinig"]].map(([q, label]) => `<button data-act="set-quality" data-value="${q}" aria-pressed="${(S.ai?.quality || "standaard") === q}">${label}</button>`).join("")}</div>
+    <p class="footnote">${S.ai?.quality === "zuinig" ? `Zuinig: een foto herkennen en een bestelling lezen doet het goedkope ${h(service.helper_model)}; de stylist blijft op ${h(service.model)}.`
+      : `Standaard: alles met ${h(service.model)}. Zuinig laat een foto herkennen en een bestelling lezen over aan het goedkopere ${h(service.helper_model)}.`}</p>
     <p class="footnote">Maak een sleutel op ${h(service.console || "console.anthropic.com")}. Je kan voor beide diensten een sleutel bewaren
       en wisselen wanneer je wil; de herkenning en de stylist gebruiken de gekozen dienst. Een sleutel wordt versleuteld met je wachtwoord bewaard: niemand anders kan hem lezen.
       Een foto herkennen of een outfit vragen kost meestal minder dan een cent.</p>
+    ${costsSection()}
+    <h2 class="section-title">Meldingen</h2>
+    ${notificationsSection()}
     <h2 class="section-title">Account</h2>
     <div class="card">
       <div class="row"><span class="grow">Ingelogd als</span><span class="v">${h(user.username)}${user.is_admin ? " (beheerder)" : ""}</span></div>
@@ -745,6 +774,87 @@ function renderSettings() {
       <div class="row"><button class="row-button danger" data-act="logout">Afmelden</button></div></div>
     ${user.is_admin ? usersSection() : ""}
     <p class="footnote" style="margin-top:24px;text-align:center">Dressing${S.version ? ` · versie ${h(S.version)}` : ""}</p>`;
+}
+
+const TASKS = { herkennen: "Foto herkennen", bestelling: "Bestelling lezen", stylist: "Stylist" };
+
+/** What the AI cost this year: an estimate from the tokens each answer reports, times the list price. */
+function costsSection() {
+  const u = S.ai_usage;
+  if (!u?.count) return "";
+  const when = (at) => new Date(at).toLocaleString("nl-BE", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  return `<h2 class="section-title">AI-kosten in ${u.year}</h2>
+    <div class="card">
+      <div class="row"><span class="grow">${plural(u.count, "analyse", "analyses")}</span><span class="v">${u.partial ? "≥ " : "≈ "}${euros(u.cost_eur)}</span></div>
+      ${u.per_model.map((m) => `<div class="row"><span class="grow muted">${h(m.models)}<span class="small" style="display:block">${plural(m.count, "analyse", "analyses")}</span></span>
+        <span class="v">${euros(m.cost_eur)}</span></div>`).join("")}
+    </div>
+    <h2 class="section-title">Laatste analyses</h2>
+    <div class="card">${u.latest.map((a) => `<div class="row"><span class="grow">${h(TASKS[a.task] || a.task)}${a.failed ? " (mislukt)" : ""}
+        <span class="muted small" style="display:block">${h(when(a.at))} · ${h(a.models)} · ${(a.input_tokens + a.output_tokens).toLocaleString("nl-BE")} tokens</span></span>
+        <span class="v">${a.status === "unknown" ? "?" : euros(a.cost_eur)}</span></div>`).join("")}</div>
+    <p class="footnote">Een schatting: de tokens die elk antwoord meldt, maal de prijslijst. Wat je echt betaalt, staat op ${h(aiService().console || "console.anthropic.com")}.
+      Een bedrag met ≥ mist een deel dat niet geprijsd kon worden.</p>`;
+}
+
+// MARK: - Notifications (Web Push), as in CellarPeaks
+
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const standalone = () => window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+// An iPad says it is a Mac (with a touch screen).
+const onIOS = () => !/Android/.test(navigator.userAgent)
+  && (/iPhone|iPad/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+
+/** Whether this device has notifications on; checked once when the settings are shown. */
+async function checkPush() {
+  ui.push = { ...(ui.push || {}), checked: true };
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    ui.push.here = !!sub;
+    // Same handle as the server's: the first 16 hex characters of the endpoint's SHA-256.
+    const hash = sub ? new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sub.endpoint))) : null;
+    ui.push.hereId = hash ? [...hash].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16) : null;
+  } catch { ui.push.here = false; }
+  try { ui.push.devices = await api("/api/push/devices"); } catch { ui.push.devices = null; }
+  if (ui.tab === "settings" && !stack.length) render();
+}
+
+function notificationsSection() {
+  const p = ui.push || {};
+  if (!pushSupported()) {
+    return `<div class="card pad muted">${onIOS() && !standalone()
+      ? "Meldingen werken op de iPhone enkel in de app op je beginscherm (iOS 16.4 of nieuwer). Open Dressing via dat icoon."
+      : "Deze browser ondersteunt geen meldingen."}</div>`;
+  }
+  if (!p.checked) checkPush();
+  const others = (p.devices || []).filter((d) => d.id !== p.hereId);
+  return `<div class="card">
+      <div class="row"><span class="grow">Hoe viel je outfit?<span class="muted small" style="display:block">${p.here ? "Aan op dit toestel" : "Uit op dit toestel"}</span></span>
+        ${p.busy ? `<div class="spinner sm"></div>` : ""}</div>
+      ${p.here ? `<div class="row"><button class="row-button" data-act="push-test" ${p.busy ? "disabled" : ""}>Stuur nu een melding</button></div>
+        <div class="row"><button class="row-button" data-act="push-off" ${p.busy ? "disabled" : ""}>Uitzetten op dit toestel</button></div>`
+        : `<div class="row"><button class="row-button" data-act="push-on" ${p.busy ? "disabled" : ""}>Meldingen aanzetten</button></div>`}
+    </div>
+    ${others.length ? `<div class="card" style="margin-top:12px">
+      <div class="row muted small">Ook aan op:</div>
+      ${others.map((d) => `<div class="row"><span class="grow">${h(d.device)}<span class="muted small" style="display:block">sinds ${h(shortDate(d.created_at.slice(0, 10)))}</span></span>
+        <button class="btn-plain small" style="color:var(--red)" data-act="push-forget" data-id="${h(d.id)}">Verwijder</button></div>`).join("")}</div>` : ""}
+    ${p.error ? `<div class="notice err">${h(p.error)}</div>` : ""}
+    <p class="footnote">Noteer je een outfit van vandaag zonder score, dan vragen we om 20 uur hoe hij viel. Elke score helpt de stylist kiezen.</p>`;
+}
+
+function urlBytes(b64) {
+  const s = atob((b64 + "=".repeat((4 - (b64.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(s, (c) => c.charCodeAt(0));
+}
+
+async function pushAction(fn) {
+  ui.push = { ...(ui.push || {}), busy: true, error: null }; render();
+  try { await fn(); } catch (e) { ui.push.error = e.message; }
+  ui.push.busy = false;
+  ui.push.checked = false; // check again: this device, and the list of devices
+  render();
 }
 
 function usersSection() {
@@ -805,9 +915,16 @@ function render() {
     return;
   }
   const screens = { dressing: renderDressing, stylist: renderStylist, worn: renderWorn, settings: renderSettings };
-  const focus = document.activeElement?.dataset?.bindUi || document.activeElement?.dataset?.bindStylist; // keep typing in the search box
+  wearTable = null; // S.worn may have changed
+  // Keep typing where you were in the search box or the question, cursor included.
+  const active = document.activeElement, focus = active?.dataset?.bindUi || active?.dataset?.bindStylist;
+  const selection = focus ? [active.selectionStart, active.selectionEnd] : null;
   $("#app").innerHTML = `<div class="screen with-nav">${navBar()}${screens[ui.tab]()}</div>`;
-  if (focus) { const el = $(`[data-bind-ui="${focus}"], [data-bind-stylist="${focus}"]`); el?.focus(); el?.setSelectionRange?.(el.value.length, el.value.length); }
+  if (focus) {
+    const el = $(`[data-bind-ui="${focus}"], [data-bind-stylist="${focus}"]`);
+    el?.focus();
+    try { el?.setSelectionRange(...selection.map((n) => n ?? el.value.length)); } catch { /* not every input has a selection */ }
+  }
   $("#tabbar").innerHTML = TABS.map(([id, svg, label]) => `<button data-act="tab" data-tab="${id}" ${ui.tab === id ? 'aria-current="page"' : ""}>${svg}${label}</button>`).join("");
   updateBars();
   const page = stack.at(-1), pages = $("#pages");
@@ -843,6 +960,18 @@ function viewPhoto(src) {
   const viewer = $("#viewer");
   viewer.innerHTML = `<img src="${h(src)}" alt="Foto"><button class="close" data-act="close-viewer" aria-label="Sluiten">✕</button>`;
   viewer.showModal();
+}
+
+function openLog(id) {
+  const l = S.worn.find((x) => x.id === id);
+  if (!l) return toast("Deze outfit staat niet meer in Gedragen.");
+  push({ kind: "outfit", logId: l.id, draft: { item_ids: [...l.item_ids], date: l.date, occasion: l.occasion || "", note: l.note || "", rating: l.rating || null } });
+}
+
+/** What a notification is about: "gedragen=<id>" opens that outfit to give it a score. */
+function openFromNotification(what) {
+  const [kind, id] = what.split("=");
+  if (kind === "gedragen" && id) { stack = []; ui.tab = "worn"; render(); openLog(id); }
 }
 
 async function mutate(fn) {
@@ -907,14 +1036,13 @@ const actions = {
     const page = stack.at(-1);
     if (page.saving) return;
     page.saving = true;
-    const ok = await mutate(() => api(page.logId ? `/api/worn/${page.logId}` : "/api/worn", { method: page.logId ? "PUT" : "POST", json: page.draft }));
+    if (!page.logId) page.requestId ||= requestId();
+    const ok = await mutate(() => api(page.logId ? `/api/worn/${page.logId}` : "/api/worn",
+      { method: page.logId ? "PUT" : "POST", json: { ...page.draft, request_id: page.logId ? "" : page.requestId } }));
     page.saving = false;
     if (ok) { stack = []; if (!page.logId) ui.tab = "worn"; render(); toast(page.logId ? "Bewaard" : "Genoteerd in Gedragen"); }
   },
-  "open-log": (el) => {
-    const l = S.worn.find((x) => x.id === el.dataset.id);
-    push({ kind: "outfit", logId: l.id, draft: { item_ids: [...l.item_ids], date: l.date, occasion: l.occasion || "", note: l.note || "", rating: l.rating || null } });
-  },
+  "open-log": (el) => openLog(el.dataset.id),
   async "delete-log"() {
     const page = stack.at(-1);
     if (!confirm("Deze outfit verwijderen uit Gedragen?")) return;
@@ -961,6 +1089,30 @@ const actions = {
     if (el.dataset.value === aiProvider()) return;
     if (await mutate(() => api("/api/settings/provider", { method: "PUT", json: { provider: el.dataset.value } }))) toast(`${aiService().name} herkent en kiest nu je kleren`);
   },
+  async "set-quality"(el) {
+    if (el.dataset.value === (S.ai?.quality || "standaard")) return;
+    if (await mutate(() => api("/api/settings/quality", { method: "PUT", json: { quality: el.dataset.value } }))) toast(el.dataset.value === "zuinig" ? "Zuinig staat aan" : "Standaard staat aan");
+  },
+  "push-on": () => pushAction(async () => {
+    // Asking first, straight from the tap: iOS only shows the question for a tap.
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") throw new Error(onIOS() ? "Meldingen zijn niet toegestaan. Zet ze aan bij Instellingen op je iPhone → Meldingen → Dressing."
+      : "Meldingen zijn niet toegestaan. Zet ze aan bij de instellingen van je browser of gsm.");
+    const reg = await navigator.serviceWorker.ready;
+    const { key } = await api("/api/push/key");
+    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBytes(key) });
+    await api("/api/push/subscribe", { method: "POST", json: { subscription: sub.toJSON() } });
+    toast("Meldingen staan aan");
+  }),
+  "push-off": () => pushAction(async () => {
+    const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      await api("/api/push/unsubscribe", { method: "POST", json: { endpoint: sub.endpoint } });
+      await sub.unsubscribe();
+    }
+  }),
+  "push-forget": (el) => pushAction(async () => { await api(`/api/push/devices/${el.dataset.id}`, { method: "DELETE" }); toast("Geen meldingen meer naar dat toestel"); }),
+  "push-test": () => pushAction(async () => { await api("/api/push/test", { method: "POST" }); toast("Melding verstuurd"); }),
   async "set-model"(el) { if (await mutate(() => api("/api/settings/model", { method: "PUT", json: { model: el.dataset.value || null, provider: aiProvider() } }))) closeSheet(); },
   async audit() {
     let list;
@@ -1048,7 +1200,8 @@ async function saveItem(page, isNew) {
   page.saving = true; page.error = null; render();
   try {
     const data = draftOut(page.draft);
-    const item = isNew ? await api("/api/items", { method: "POST", json: { data, photo_token: page.photoToken || "" } })
+    if (isNew) page.requestId ||= requestId(); // the same id on a retry of this save
+    const item = isNew ? await api("/api/items", { method: "POST", json: { data, photo_token: page.photoToken || "", request_id: page.requestId } })
       : await api(`/api/items/${page.id}`, { method: "PATCH", json: data });
     if (page.file && !page.photoToken) { // a photo the AI couldn't read: still the piece's photo
       const form = new FormData(); form.append("photo", await smaller(page.file), "foto.jpg");
@@ -1103,7 +1256,11 @@ document.addEventListener("input", (e) => {
     page.pieces.forEach((p, n) => { if (p.draft.location === old) { p.draft.location = el.value; const input = document.getElementById(`o-loc-${n}`); if (input) input.value = el.value; } });
   }
   if (el.dataset.bindPage) { const p = stack.at(-1); p[el.dataset.bindPage] = el.value; if (el.dataset.bindPage === "hint") { const had = !!e.target.closest(".page").querySelector('[data-act="identify-text"]'); if (had !== !!el.value) render(); } }
-  if (el.dataset.bindUi) { ui[el.dataset.bindUi] = el.value; render(); }
+  if (el.dataset.bindUi) {
+    ui[el.dataset.bindUi] = el.value;
+    const results = $("#dressing-results");
+    if (results) results.innerHTML = dressingResults(); else render();
+  }
   if (el.dataset.bindStylist) ui.stylist[el.dataset.bindStylist] = el.value;
 });
 // A mail pasted with its layout: keep where the pictures stood, as [foto N].
@@ -1127,4 +1284,10 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 window.addEventListener("unhandledrejection", (e) => { console.error(e.reason); toast(`Er liep iets mis: ${e.reason?.message || e.reason}`); });
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
-boot();
+navigator.serviceWorker?.addEventListener("message", (e) => { if (typeof e.data?.open === "string" && ui.auth?.user) openFromNotification(e.data.open); });
+boot().then(() => {
+  const what = location.hash.slice(1);
+  if (!what) return;
+  history.replaceState(null, "", location.pathname); // a reload doesn't open it again
+  if (ui.auth?.user) openFromNotification(what);
+});

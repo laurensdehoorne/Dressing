@@ -100,6 +100,24 @@ def init() -> None:
             );
             CREATE INDEX IF NOT EXISTS login_failures_user ON login_failures (user_key, at);
             CREATE INDEX IF NOT EXISTS login_failures_ip ON login_failures (ip, at);
+            -- What each AI analysis cost (costs.py): its calls, and the sum as an estimate.
+            CREATE TABLE IF NOT EXISTS ai_usage (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), at TEXT NOT NULL, task TEXT NOT NULL,
+                status TEXT NOT NULL, failed INTEGER NOT NULL DEFAULT 0, models TEXT NOT NULL DEFAULT '',
+                input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0, cost_eur REAL NOT NULL DEFAULT 0, calls TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS ai_usage_user ON ai_usage (user_id, at);
+            -- A save the app sent with its own id, and its answer: the same id again gets that answer (main._once).
+            CREATE TABLE IF NOT EXISTS request_keys (
+                user_id TEXT NOT NULL, key TEXT NOT NULL, at TEXT NOT NULL, result TEXT, PRIMARY KEY (user_id, key)
+            );
+            -- A phone with notifications on (push.py).
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                endpoint TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), data TEXT NOT NULL,
+                created_at TEXT NOT NULL, device TEXT NOT NULL DEFAULT ''
+            );
             """
         )
 

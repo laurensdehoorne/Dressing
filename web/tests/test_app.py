@@ -12,7 +12,7 @@ from PIL import Image
 
 from types import SimpleNamespace
 
-from app import claude, db, gpt, main, weather
+from app import claude, costs, db, gpt, main, push, weather
 
 H = {"X-Dressing": "1"}
 
@@ -21,7 +21,7 @@ H = {"X-Dressing": "1"}
 def client(monkeypatch):
     db.init()
     with db.connect() as conn:
-        for table in ("worn", "items", "sessions", "login_failures", "audit_log", "users"):
+        for table in ("worn", "items", "sessions", "login_failures", "audit_log", "ai_usage", "request_keys", "push_subscriptions", "users"):
             conn.execute(f"DELETE FROM {table}")
     monkeypatch.setattr(main.keys, "active_key", lambda user, name="claude": ("sk-test", "env"))
     with TestClient(main.app) as c:
@@ -103,7 +103,7 @@ def test_stylist_gets_only_what_is_in_the_dressing(client, monkeypatch):
     client.put("/api/settings/place", json={"place": ""}, headers=H)
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
         seen["text"] = "\n".join(c["text"] for c in content)
         return {"advies": "Fris.", "outfits": [{"titel": "Look", "stukken": [here["id"], washing["id"], "verzonnen"], "waarom": "Past."}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -125,7 +125,7 @@ def test_stylist_uses_the_weather(client, monkeypatch):
     monkeypatch.setattr(weather, "forecast", forecast)
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
         seen["text"] = content[-1]["text"]
         return {"advies": "", "outfits": []}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -204,7 +204,7 @@ def test_openai_key_is_checked_and_kept_apart(client, monkeypatch):
 def test_order_mail_gives_pieces_with_their_photos(client, monkeypatch):
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
         seen["tool"], seen["text"] = tool["name"], content[-1]["text"]
         seen["labels"] = [c["text"] for c in content if c["type"] == "text"][:-1]
         seen["images"] = sum(c["type"] == "image" for c in content)
@@ -254,7 +254,7 @@ def test_suitcase_trip_and_stylist(client, monkeypatch):
     assert trip["place"]["name"] == "Barcelona, Spanje" and trip["item_ids"] == []
     seen = []
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
         seen.append("\n".join(c["text"] for c in content))
         return {"advies": "", "outfits": [{"titel": "Look", "stukken": [shirt["id"], coat["id"]], "waarom": "."}]}
     monkeypatch.setattr(claude, "_ask", fake_ask)
@@ -296,7 +296,7 @@ def test_order_from_screenshots_cuts_out_the_photos(client, monkeypatch):
     shot.save(out, "PNG")
     seen = {}
 
-    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None):
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
         seen["labels"] = [c["text"] for c in content if c["type"] == "text"]
         w = 725  # the screenshot as the AI sees it: 1170×2532 brought to 1568 high
         scale = w / 1170
@@ -378,3 +378,136 @@ def test_chatgpt_looks_up_the_weather_too(client, monkeypatch):
     r = client.post("/api/stylist", json={"query": "uitstap naar Amsterdam"}, headers=H)
     assert r.status_code == 200, r.text
     assert r.json()["elsewhere"][0]["days"][0]["max"] == 11
+
+
+def test_photo_work_runs_off_the_event_loop(client, monkeypatch):
+    """Decoding and scaling photos happens in a thread, so the server keeps answering in the meantime."""
+    import asyncio
+    real, in_loop = main._jpeg, []
+
+    def watched(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            in_loop.append(args[1:])
+        except RuntimeError:
+            pass
+        return real(*args, **kwargs)
+    monkeypatch.setattr(main, "_jpeg", watched)
+
+    async def fake_identify(user, photo, hint):
+        return {"name": "Trui", "category": "trui"}
+    monkeypatch.setattr(claude, "identify_item", fake_identify)
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False):
+        return {"winkel": "Zara", "stukken": [{"naam": "Trui", "categorie": "trui", "foto": 1, "screenshot": 1, "vak": [10, 10, 200, 300]}]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    monkeypatch.setattr(main, "_fetch_photo", lambda url: real(jpeg(), 1200, 78))
+
+    item = add(client)
+    assert client.post(f"/api/items/{item['id']}/photo", files={"photo": ("f.jpg", jpeg(), "image/jpeg")}, headers=H).status_code == 200
+    assert client.post("/api/identify", files={"photo": ("f.jpg", jpeg(), "image/jpeg")}, headers=H).status_code == 200
+    assert client.post("/api/order", json={"text": "Bestelling: [foto 1] trui 39,95 EUR", "photos": ["https://x.example/t.jpg"]},
+                       headers=H).status_code == 200
+    shot = io.BytesIO()
+    Image.new("RGB", (600, 900), "navy").save(shot, "PNG")
+    assert client.post("/api/order/screenshots", files=[("shots", ("s.png", shot.getvalue(), "image/png"))], headers=H).status_code == 200
+    assert in_loop == []
+
+
+def test_server_days_are_belgian():
+    """The image sets TZ, so 'today' is the day it is in Belgium, also just after midnight."""
+    assert "TZ=Europe/Brussels" in (main.STATIC_DIR.parent / "Dockerfile").read_text()
+
+
+# MARK: - AI costs, Zuinig, saving once, notifications
+
+def _fake_claude(monkeypatch, answer: dict, sent: list):
+    """Claude answering with `answer` as its tool call, and the usage Anthropic reports."""
+    class FakeMessages:
+        async def create(self, **kwargs):
+            sent.append(kwargs)
+            usage = SimpleNamespace(input_tokens=1000, output_tokens=200, cache_creation_input_tokens=3000,
+                                    cache_read_input_tokens=0, service_tier="standard")
+            call = SimpleNamespace(type="tool_use", id="t1", name=kwargs["tools"][0]["name"], input=answer)
+            return SimpleNamespace(content=[call], stop_reason="tool_use", model=kwargs["model"], usage=usage)
+    monkeypatch.setattr(claude, "client", lambda user: SimpleNamespace(beta=SimpleNamespace(messages=FakeMessages())))
+
+
+def test_price_of_one_claude_answer():
+    usage = {"input_tokens": 1000, "output_tokens": 200, "cache_creation_input_tokens": 3000, "cache_read_input_tokens": 5000}
+    call = costs.from_anthropic("claude-sonnet-5-5", usage)
+    # 1000 plain × $2 + 3000 written × $2.50 + 5000 read × $0.10 + 200 out × $10, per million tokens
+    assert call.status == "estimated" and call.input_tokens == 9000
+    assert abs(call.cost_usd - (1000 * 2 + 3000 * 2.5 + 5000 * 0.1 + 200 * 10) / 1e6) < 1e-12
+    assert costs.from_anthropic("claude-nieuw-9", usage).status == "unknown"  # not on the price list: no guess
+    assert costs.from_openai("gpt-6-luna", {"input_tokens": 10, "output_tokens": 5}).status == "partial"  # no cache details
+
+
+def test_stylist_answer_is_metered_and_shown_in_settings(client, monkeypatch):
+    shirt = add(client, name="Wit hemd")
+    client.put("/api/settings/place", json={"place": ""}, headers=H)
+    _fake_claude(monkeypatch, {"advies": "Ok.", "outfits": [{"titel": "Kantoor", "stukken": [shirt["id"]]}]}, [])
+    r = client.post("/api/stylist", json={"query": "kantoor"}, headers=H).json()
+    assert r["analysis"]["status"] == "estimated" and r["analysis"]["cost_eur"] > 0
+    usage = client.get("/api/state").json()["ai_usage"]
+    assert usage["count"] == 1 and usage["latest"][0]["task"] == "stylist"
+    assert usage["per_model"][0]["models"] == claude.DEFAULT_MODEL
+
+
+def test_zuinig_reads_a_photo_with_the_helper_model(client, monkeypatch):
+    sent = []
+    _fake_claude(monkeypatch, {"naam": "Trui", "categorie": "trui"}, sent)
+    client.post("/api/identify", data={"hint": "blauwe trui"}, headers=H)
+    assert sent[-1]["model"] == claude.DEFAULT_MODEL  # standaard: the account's model
+    assert client.put("/api/settings/quality", json={"quality": "zuinig"}, headers=H).json()["quality"] == "zuinig"
+    client.post("/api/identify", data={"hint": "blauwe trui"}, headers=H)
+    assert sent[-1]["model"] == claude.HELPER_MODEL
+    shirt = add(client)
+    _fake_claude(monkeypatch, {"advies": "", "outfits": [{"titel": "x", "stukken": [shirt["id"]]}]}, sent)
+    client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    assert sent[-1]["model"] == claude.DEFAULT_MODEL  # the stylist keeps the account's model
+    assert client.put("/api/settings/quality", json={"quality": "gratis"}, headers=H).status_code == 400
+
+
+def test_a_save_sent_twice_is_kept_once(client):
+    body = {"data": {"name": "Wit hemd", "category": "top"}, "request_id": "save-1234-abcd"}
+    first = client.post("/api/items", json=body, headers=H).json()
+    again = client.post("/api/items", json=body, headers=H).json()
+    assert first["id"] == again["id"] and len(client.get("/api/state").json()["items"]) == 1
+    worn = {"item_ids": [first["id"]], "request_id": "wear-1234-abcd"}
+    assert client.post("/api/worn", json=worn, headers=H).json()["id"] == client.post("/api/worn", json=worn, headers=H).json()["id"]
+    assert len(client.get("/api/state").json()["worn"]) == 1
+    # A save that failed gives its id back: the retry does it.
+    bad = {"data": {"name": ""}, "request_id": "save-5678-abcd"}
+    assert client.post("/api/items", json=bad, headers=H).status_code == 400
+    assert client.post("/api/items", json={**bad, "data": {"name": "Jeans"}}, headers=H).status_code == 200
+
+
+def test_ask_how_the_outfit_was_in_the_evening():
+    from datetime import datetime, timezone
+    morning = datetime(2026, 10, 24, 6, 0, tzinfo=timezone.utc)  # 8:00 in Brussels (summer time)
+    day = morning.astimezone().date().isoformat()
+    assert push.ask_when(day, morning) == datetime(2026, 10, 24, 20, 0).astimezone().astimezone(timezone.utc).isoformat(timespec="seconds")
+    late = datetime(2026, 10, 24, 20, 30, tzinfo=timezone.utc)
+    assert push.ask_when(late.astimezone().date().isoformat(), late) == "2026-10-24T21:00:00+00:00"  # later: in half an hour
+    assert push.ask_when("2026-10-20", morning) is None  # an outfit noted afterwards for an earlier day
+
+
+def test_outfit_question_goes_to_the_phone(client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    shirt = add(client, name="Wit hemd")
+    sub = {"endpoint": "https://web.push.apple.com/abc", "keys": {"p256dh": "k", "auth": "a"}}
+    assert client.post("/api/push/subscribe", json={"subscription": sub}, headers=H).json()["devices"][0]["device"]
+    today = datetime.now().astimezone().date().isoformat()
+    unrated = client.post("/api/worn", json={"item_ids": [shirt["id"]], "date": today}, headers=H).json()
+    rated = client.post("/api/worn", json={"item_ids": [shirt["id"]], "date": today, "rating": 4}, headers=H).json()
+    assert unrated["ask_at"] and "ask_at" not in rated  # a score already given: nothing to ask
+    sent = []
+    monkeypatch.setattr(push, "_send_one", lambda subscription, message: sent.append((subscription["endpoint"], message)) or True)
+    import asyncio
+    asyncio.run(push.send_questions(datetime.fromisoformat(unrated["ask_at"]) + timedelta(minutes=1)))
+    assert sent == [(sub["endpoint"], {"title": "👕 Hoe viel je outfit?", "body": "Wit hemd: geef een score, dan kiest de stylist "
+                     "voortaan beter.", "url": f"/#gedragen={unrated['id']}", "tag": f"dressing-rate-{unrated['id']}"})]
+    asyncio.run(push.send_questions(datetime.now(timezone.utc) + timedelta(days=1)))
+    assert len(sent) == 1  # asked once
+    assert client.delete(f"/api/push/devices/{push.device_id(sub['endpoint'])}", headers=H).json()["devices"] == []

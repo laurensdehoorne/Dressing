@@ -3,6 +3,7 @@ fastapi>=0.142,<1
 uvicorn[standard]>=0.54,<1
 pillow>=12,<13
 python-multipart>=0.0.32
+pywebpush>=2.0,<3
 cryptography>=43
 openai>=3,<4
 pypdf>=6,<7

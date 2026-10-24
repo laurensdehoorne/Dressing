@@ -1,9 +1,10 @@
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DATA_DIR=/data
+# Belgian time: "today" for the stylist and the trip is the day it is here, also just after midnight.
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DATA_DIR=/data TZ=Europe/Brussels
 WORKDIR /srv
 COPY requirements.txt .
-RUN pip install -r requirements.txt && apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
+RUN pip install -r requirements.txt && apt-get update && apt-get install -y --no-install-recommends gosu tzdata && rm -rf /var/lib/apt/lists/*
 COPY app ./app
 COPY static ./static
 COPY entrypoint.sh /entrypoint.sh

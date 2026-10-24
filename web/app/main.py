@@ -28,7 +28,7 @@ import pypdf
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
-from . import audit, auth, claude, db, gpt, keys, weather
+from . import audit, auth, claude, costs, db, gpt, keys, push, weather
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 BACKUPS_TO_KEEP = 14
@@ -37,9 +37,10 @@ BACKUPS_TO_KEEP = 14
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
-    task = asyncio.create_task(_daily_maintenance())
+    tasks = [asyncio.create_task(_daily_maintenance()), asyncio.create_task(push.question_loop())]
     yield
-    task.cancel()
+    for task in tasks:
+        task.cancel()
 
 
 app = FastAPI(title="Dressing", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -303,7 +304,7 @@ def delete_user(user_id: str, admin: Admin, request: Request):
         if not row:
             raise HTTPException(404, "Account niet gevonden.")
         items = [r["id"] for r in conn.execute("SELECT id FROM items WHERE user_id = ?", (user_id,))]
-        for table in ("worn", "items", "sessions"):
+        for table in ("worn", "items", "sessions", "ai_usage", "request_keys", "push_subscriptions"):
             conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         audit.record(request, "account_deleted", row["username"], None, conn)
@@ -356,9 +357,9 @@ def _ai_info(user: dict) -> dict:
     """Per service: its key (only a hint), its model and its default; plus which service is in use."""
     services = {name: {"name": spec["name"], "company": spec["company"], "console": spec["console"],
                        "api_key": _key_info(user, name), "model": _service(name).model(user),
-                       "default_model": _service(name).DEFAULT_MODEL}
+                       "default_model": _service(name).DEFAULT_MODEL, "helper_model": _service(name).HELPER_MODEL}
                 for name, spec in keys.PROVIDERS.items()}
-    return {"provider": keys.provider(user), "services": services}
+    return {"provider": keys.provider(user), "services": services, "quality": claude.quality(user)}
 
 
 @app.get("/api/state")
@@ -373,6 +374,7 @@ def state(user: User):
             "statuses": [{"key": k, "label": v} for k, v in db.STATUSES.items()],
             "seasons": db.SEASONS, "formality": db.FORMALITY, "warmth": db.WARMTH,
             "ai": _ai_info(user),
+            "ai_usage": costs.overview(conn, user),
             "place": settings.get("place"),
             "trip": settings.get("trip"),
             "profile": settings.get("profile") or "",
@@ -390,6 +392,19 @@ class ProviderIn(BaseModel):
 def set_provider(body: ProviderIn, user: User):
     """Claude or ChatGPT for this account's recognition and stylist."""
     auth.put_user_setting(user, "ai_provider", _provider_name(body.provider, user))
+    return _ai_info(user)
+
+
+class QualityIn(BaseModel):
+    quality: str
+
+
+@app.put("/api/settings/quality")
+def set_quality(body: QualityIn, user: User):
+    """Zuinig or standaard: whether recognising a piece and reading an order use the cheap helper model."""
+    if body.quality not in claude.QUALITY:
+        raise HTTPException(400, "Kies zuinig of standaard.")
+    auth.put_user_setting(user, "quality", body.quality)
     return _ai_info(user)
 
 
@@ -476,13 +491,50 @@ async def get_weather(user: User):
 
 # MARK: - Items (the pieces in the dressing)
 
+REQUEST_KEY = re.compile(r"[A-Za-z0-9-]{8,64}")
+REQUEST_KEY_DAYS = 2
+
+
+def _once(user: dict, key: str, work):
+    """Runs a save that the app sent with its own id once: the same id again (a second tap, a retry after an answer
+    that got lost) gets the first one's answer, also while the first is still busy. Without an id it just runs."""
+    if not REQUEST_KEY.fullmatch(key or ""):
+        return work()
+    for _ in range(100):  # up to ten seconds for a first one that is still busy
+        with db.connect() as conn:
+            try:
+                conn.execute("INSERT INTO request_keys (user_id, key, at) VALUES (?, ?, ?)", (user["id"], key, db.now_iso()))
+                break  # ours: do it
+            except sqlite3.IntegrityError:
+                row = conn.execute("SELECT result FROM request_keys WHERE user_id = ? AND key = ?", (user["id"], key)).fetchone()
+        if row and row["result"] is not None:
+            return json.loads(row["result"])
+        time.sleep(0.1)  # the first one is busy (or just failed and gave its id back)
+    else:
+        raise HTTPException(409, "Dit wordt al bewaard.")
+    try:
+        result = work()
+    except BaseException:
+        with db.connect() as conn:  # failed: the id is free again, a retry may do it
+            conn.execute("DELETE FROM request_keys WHERE user_id = ? AND key = ?", (user["id"], key))
+        raise
+    with db.connect() as conn:
+        conn.execute("UPDATE request_keys SET result = ? WHERE user_id = ? AND key = ?", (json.dumps(result, default=str), user["id"], key))
+    return result
+
+
 class ItemIn(BaseModel):
     data: dict
     photo_token: str = ""
+    request_id: str = ""  # the app's id for this save (see _once)
 
 
 @app.post("/api/items")
 def create_item(body: ItemIn, user: User):
+    return _once(user, body.request_id, lambda: _create_item(body, user))
+
+
+def _create_item(body: ItemIn, user: dict) -> dict:
     data = db.clean_item(body.data)
     if not (data.get("name") or "").strip():
         raise HTTPException(400, "Geef het kledingstuk een naam.")
@@ -519,7 +571,7 @@ def delete_item(item_id: str, user: User):
 @app.post("/api/items/{item_id}/photo")
 async def set_item_photo(item_id: str, user: User, photo: UploadFile = File(...)):
     raw = await photo.read()
-    jpeg = _jpeg(raw, 1200, 78)
+    jpeg = await asyncio.to_thread(_jpeg, raw, 1200, 78)
     with db.connect() as conn:
         _get_item(conn, item_id, user)
         _remove_photo(item_id)
@@ -536,6 +588,7 @@ class WornIn(BaseModel):
     occasion: str = ""
     note: str = ""
     rating: int | None = None
+    request_id: str = ""  # the app's id for this save (see _once)
 
 
 def _worn_data(conn, body: WornIn, user: dict) -> tuple[str, dict]:
@@ -553,8 +606,13 @@ def _worn_data(conn, body: WornIn, user: dict) -> tuple[str, dict]:
 
 @app.post("/api/worn")
 def add_worn(body: WornIn, user: User):
+    return _once(user, body.request_id, lambda: _add_worn(body, user))
+
+
+def _add_worn(body: WornIn, user: dict) -> dict:
     with db.connect() as conn:
         day, data = _worn_data(conn, body, user)
+        push.ask_later(conn, user["id"], day, data)  # "Hoe viel je outfit?" this evening, without a score
         log_id = db.new_id()
         conn.execute("INSERT INTO worn (id, user_id, date, data) VALUES (?, ?, ?, ?)", (log_id, user["id"], day, json.dumps(data)))
         return db.worn_row(conn.execute("SELECT * FROM worn WHERE id = ?", (log_id,)).fetchone())
@@ -580,12 +638,31 @@ def delete_worn(log_id: str, user: User):
 
 # MARK: - Claude
 #
+# Decoding, scaling and cutting photos takes a while for big ones, so it runs in a thread (asyncio.to_thread): the
+# server keeps answering the app in the meantime, also the "is it done yet?" of an analysis that is running.
+#
 # Analyses run in the background when the app asks (?background=1): it gets a job number at once and asks every few
 # seconds whether the answer is there. A phone never holds one request open for minutes, which Safari (and a
 # connection that drops while the phone sleeps) breaks off.
 
 _jobs: dict[str, dict] = {}
 JOB_SECONDS = 30 * 60
+
+
+async def _analysis(user: dict, task: str, work):
+    """Runs one AI analysis under a cost meter: every API call it makes is kept as one analysis, also when it fails
+    (those tokens are billed too). Its result gets "analysis" with the estimated cost."""
+    calls: list[costs.Call] = []
+    token = costs.METER.set(calls)  # here, inside the task that runs the analysis: its own meter
+    try:
+        result = await work
+    except BaseException:
+        costs.store(user, task, calls, failed=True)
+        raise
+    finally:
+        costs.METER.reset(token)
+    analysis = costs.store(user, task, calls)
+    return {**result, "analysis": analysis} if isinstance(result, dict) and analysis else result
 
 
 async def _background(request: Request, user: dict, work):
@@ -627,15 +704,20 @@ async def identify(user: AIUser, request: Request, photo: UploadFile | None = Fi
     raw = await photo.read() if photo else b""  # now: the upload is gone once this request ends
     if not raw and not hint.strip():
         raise HTTPException(400, "Kies een foto of beschrijf het kledingstuk.")
-    return await _background(request, user, _identify(user, raw, hint))
+    return await _background(request, user, _analysis(user, "herkennen", _identify(user, raw, hint)))
+
+
+def _keep_photo(raw: bytes) -> tuple[bytes, str]:
+    """The photo as the AI sees it, and a token for the copy kept for the new piece."""
+    upload, token = _jpeg(raw, 1568, 80), db.new_id().replace("-", "")
+    (db.TMP_DIR / f"{token}.jpg").write_bytes(_jpeg(raw, 1200, 78))
+    return upload, token
 
 
 async def _identify(user: dict, raw: bytes, hint: str):
     token = upload = None
     if raw:
-        upload = _jpeg(raw, 1568, 80)
-        token = db.new_id().replace("-", "")
-        (db.TMP_DIR / f"{token}.jpg").write_bytes(_jpeg(raw, 1200, 78))
+        upload, token = await asyncio.to_thread(_keep_photo, raw)
     return {"info": await claude.identify_item(user, upload, hint.strip() or None), "photo_token": token}
 
 
@@ -660,7 +742,7 @@ async def read_order(body: OrderIn, user: AIUser, request: Request):
         claude.report(step="Foto's ophalen")
         got = await asyncio.gather(*(asyncio.to_thread(_fetch_photo, u) for u in urls))
         return await _read_order(user, text, {n: jpeg for n, jpeg in enumerate(got, 1) if jpeg})
-    return await _background(request, user, fetched_then_read())
+    return await _background(request, user, _analysis(user, "bestelling", fetched_then_read()))
 
 
 @app.post("/api/order/pdf")
@@ -670,7 +752,7 @@ async def read_order_pdf(user: AIUser, request: Request, pdf: UploadFile = File(
     text, photos = await asyncio.to_thread(_pdf_contents, raw)
     if len(text.strip()) < 20:
         raise HTTPException(400, "In deze PDF staat geen leesbare tekst. Kies de PDF van de bestelmail.")
-    return await _background(request, user, _read_order(user, text[:40000], photos))
+    return await _background(request, user, _analysis(user, "bestelling", _read_order(user, text[:40000], photos)))
 
 
 MAX_SHOTS = 6
@@ -684,11 +766,11 @@ async def read_order_screenshots(user: AIUser, request: Request, shots: list[Upl
     if len(shots) > MAX_SHOTS:
         raise HTTPException(400, f"Kies hoogstens {MAX_SHOTS} screenshots.")
     raws = [await shot.read() for shot in shots]
-    originals = [Image.open(io.BytesIO(_jpeg(raw, 3000, 90))) for raw in raws]
-    return await _background(request, user, _read_screenshots(user, originals))
+    originals = await asyncio.to_thread(lambda: [Image.open(io.BytesIO(_jpeg(raw, 3000, 90))) for raw in raws])
+    return await _background(request, user, _analysis(user, "bestelling", _read_screenshots(user, originals)))
 
 
-async def _read_screenshots(user: dict, originals: list[Image.Image]):
+def _shots_to_send(originals: list[Image.Image]) -> list[tuple[bytes, tuple[int, int]]]:
     sent = []
     for img in originals:
         small = img.copy()
@@ -696,7 +778,11 @@ async def _read_screenshots(user: dict, originals: list[Image.Image]):
         out = io.BytesIO()
         small.save(out, "JPEG", quality=82)
         sent.append((out.getvalue(), small.size))
-    found = await claude.read_order(user, "", {}, sent)
+    return sent
+
+
+def _cut_out(found: dict, originals: list[Image.Image], sent: list) -> None:
+    """Each piece's photo, cut from the sharp original where the AI says it is on the screenshot."""
     for piece in found["pieces"]:
         if crop := piece.pop("crop", None):
             n, (x0, y0, x1, y1) = crop
@@ -704,7 +790,13 @@ async def _read_screenshots(user: dict, originals: list[Image.Image]):
             out = io.BytesIO()
             img.crop((round(x0 * scale), round(y0 * scale), round(x1 * scale), round(y1 * scale))).save(out, "JPEG", quality=85)
             piece["jpeg"] = _jpeg(out.getvalue(), 1200, 80)
-    return _order_result(found, {})
+
+
+async def _read_screenshots(user: dict, originals: list[Image.Image]):
+    sent = await asyncio.to_thread(_shots_to_send, originals)
+    found = await claude.read_order(user, "", {}, sent)
+    await asyncio.to_thread(_cut_out, found, originals, sent)
+    return await asyncio.to_thread(_order_result, found, {})
 
 
 def _pdf_contents(raw: bytes) -> tuple[str, dict[int, bytes]]:
@@ -783,8 +875,9 @@ def _big_enough(jpeg: bytes) -> bool:
 
 
 async def _read_order(user: dict, text: str, photos: dict[int, bytes]):
-    found = await claude.read_order(user, text, {n: _jpeg(jpeg, 512, 75) for n, jpeg in photos.items()})
-    return _order_result(found, photos)
+    small = await asyncio.to_thread(lambda: {n: _jpeg(jpeg, 512, 75) for n, jpeg in photos.items()})
+    found = await claude.read_order(user, text, small)
+    return await asyncio.to_thread(_order_result, found, photos)
 
 
 def _order_result(found: dict, photos: dict[int, bytes]) -> dict:
@@ -874,7 +967,7 @@ async def stylist(body: StylistIn, user: AIUser, request: Request):
     query = body.query.strip()[:1000]
     if not query:
         raise HTTPException(400, "Waarvoor zoek je een outfit?")
-    return await _background(request, user, _stylist(user, query, body.use_weather, body.trip))
+    return await _background(request, user, _analysis(user, "stylist", _stylist(user, query, body.use_weather, body.trip)))
 
 
 async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = False):
@@ -924,6 +1017,58 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
                                           packed=packed, weather_at=weather_at if use_weather and not on_trip else None)
     return {**result, "weather": forecast, "elsewhere": elsewhere}
+
+
+# MARK: - Notifications ("Hoe viel je outfit?")
+
+@app.get("/api/push/key")
+def push_key(user: User):
+    return {"key": push.public_key()}
+
+
+class PushIn(BaseModel):
+    subscription: dict
+
+
+@app.post("/api/push/subscribe")
+def push_subscribe(body: PushIn, user: User, request: Request):
+    try:
+        push.save(user, body.subscription, auth.device_name(request.headers.get("user-agent", "")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"devices": push.devices(user)}
+
+
+class EndpointIn(BaseModel):
+    endpoint: str
+
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe(body: EndpointIn, user: User):
+    push.remove(user, body.endpoint)
+    return {"devices": push.devices(user)}
+
+
+@app.get("/api/push/devices")
+def push_devices(user: User):
+    return push.devices(user)
+
+
+@app.delete("/api/push/devices/{did}")
+def push_forget_device(did: str, user: User):
+    """Stops notifications to one device, e.g. an old installation of the app that no longer exists."""
+    if not push.forget(user, did):
+        raise HTTPException(404, "Toestel niet gevonden.")
+    return {"devices": push.devices(user)}
+
+
+@app.post("/api/push/test")
+async def push_test(user: User):
+    message = {"title": "👕 Dressing", "body": "Meldingen staan aan. Draag je een outfit zonder score, dan vragen we 's avonds hoe hij viel.",
+               "url": "/"}
+    if not await push.send(user["id"], message):
+        raise HTTPException(400, "Er is geen toestel met meldingen aan. Zet ze eerst aan op je gsm.")
+    return {"ok": True}
 
 
 # MARK: - Photos
@@ -982,6 +1127,9 @@ def _maintenance() -> None:
         if tmp.stat().st_mtime < cutoff:
             tmp.unlink(missing_ok=True)
     audit.prune()
+    with db.connect() as conn:  # a retry comes within seconds; two days is plenty
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=REQUEST_KEY_DAYS)).isoformat(timespec="seconds")
+        conn.execute("DELETE FROM request_keys WHERE at < ?", (cutoff,))
 
 
 async def _daily_maintenance():

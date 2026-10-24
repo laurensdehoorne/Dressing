@@ -10,9 +10,13 @@ from datetime import date
 
 import anthropic
 
-from . import auth, db, keys
+from . import auth, costs, db, keys
 
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+HELPER_MODEL = os.environ.get("CLAUDE_HELPER_MODEL", "claude-haiku-5-5")  # the cheap model of "Zuinig"
+# Zuinig: recognising a piece and reading an order with the cheap helper model; the stylist keeps the account's model.
+QUALITY = {"zuinig": "Zuinig", "standaard": "Standaard"}
+DEFAULT_QUALITY = "standaard"
 # One analysis never takes longer than this: past it, the app says so instead of showing its spinner for minutes.
 LOOKUP_SECONDS = float(os.environ.get("LOOKUP_SECONDS", "180"))
 TOO_SLOW = "Het antwoord duurde te lang. Probeer opnieuw."
@@ -54,6 +58,16 @@ def client(user: dict) -> anthropic.AsyncAnthropic:
 def model(user: dict) -> str:
     """The model this account chose, else CLAUDE_MODEL from .env, else the built-in default."""
     return auth.user_settings(user).get("model") or DEFAULT_MODEL
+
+
+def quality(user: dict) -> str:
+    chosen = auth.user_settings(user).get("quality")
+    return chosen if chosen in QUALITY else DEFAULT_QUALITY
+
+
+def thrifty(user: dict) -> bool:
+    """Whether this account's lighter work (a photo, an order) goes to the cheap helper model."""
+    return quality(user) == "zuinig"
 
 
 def _sees_photos(m) -> bool:
@@ -115,19 +129,26 @@ async def run_helper(helpers: Helpers, name: str, given) -> str:
         return f"Niet gelukt: {e}"
 
 
-async def _ask(user: dict, tool: dict, *, system: str, content: list, effort: str = "low", helpers: Helpers | None = None) -> dict:
-    """Asks the AI service this account chose; the questions, tool and answers are the same for both."""
+async def _ask(user: dict, tool: dict, *, system: str, content: list, effort: str = "low", helpers: Helpers | None = None,
+               helper: bool = False) -> dict:
+    """Asks the AI service this account chose; the questions, tool and answers are the same for both. With `helper`,
+    its cheap helper model instead of the account's model."""
     if keys.provider(user) == "openai":
         from . import gpt
-        return await gpt.run_until_tool_call(user, tool, system=system, content=content, effort=effort, helpers=helpers or {})
-    return await _ask_claude(user, tool, system=system, content=content, effort=effort, helpers=helpers or {})
+        name, provider, asking = (gpt.HELPER_MODEL if helper else gpt.model(user)), "openai", gpt.run_until_tool_call
+    else:
+        name, provider, asking = (HELPER_MODEL if helper else model(user)), "anthropic", _ask_claude
+    try:
+        return await asking(user, tool, system=system, content=content, effort=effort, helpers=helpers or {}, name=name)
+    except asyncio.CancelledError:  # cut off after too long (_timed): the call may still be billed
+        costs.lost(provider, name, "afgebroken na te lang wachten")
+        raise
 
 
-async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, effort: str, helpers: Helpers) -> dict:
-    """Sends the question until Claude calls `tool`, then returns that call's input; a helper it calls on the way is
-    answered and the conversation goes on. Forced tool use isn't accepted by the current models, so the tool is offered
-    and asked for by name."""
-    name = model(user)
+async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, effort: str, helpers: Helpers, name: str) -> dict:
+    """Sends the question to model `name` until Claude calls `tool`, then returns that call's input; a helper it calls
+    on the way is answered and the conversation goes on. Forced tool use isn't accepted by the current models, so the
+    tool is offered and asked for by name."""
     messages: list[dict] = [{"role": "user", "content": content}]
     for _ in range(3 + 2 * bool(helpers)):
         try:
@@ -153,6 +174,7 @@ async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, eff
             if e.status_code >= 500:
                 raise ClaudeError("Claude is tijdelijk overbelast. Probeer zo dadelijk opnieuw.")
             raise ClaudeError(_reason(e))
+        costs.track_anthropic(name, response)
 
         for block in response.content:
             if block.type == "tool_use" and block.name == tool["name"]:
@@ -188,7 +210,7 @@ async def identify_item(user: dict, photo_jpeg: bytes | None, hint: str | None) 
                                                     "data": base64.b64encode(photo_jpeg).decode()}})
     content.append({"type": "text", "text": f"Omschrijving van de gebruiker: {hint}" if hint else "Beschrijf dit kledingstuk."})
     report(step="Foto bekijken")
-    got = await _timed(_ask(user, ITEM_TOOL, system=IDENTIFY_SYSTEM, content=content))
+    got = await _timed(_ask(user, ITEM_TOOL, system=IDENTIFY_SYSTEM, content=content, helper=thrifty(user)))
     info = db.clean_item({
         "name": got.get("naam"), "category": got.get("categorie"), "kind": got.get("soort"), "colors": got.get("kleuren"),
         "pattern": got.get("patroon"), "material": got.get("materiaal"), "brand": got.get("merk"), "fit": got.get("pasvorm"),
@@ -242,7 +264,7 @@ async def read_order(user: dict, text: str, photos: dict[int, bytes], shots: lis
     question += f"\n\nDe bestelmail:\n{text}" if text else "\n\nLees de bestelling van de screenshots hierboven."
     content.append({"type": "text", "text": question})
     report(step="Bestelling lezen")
-    got = await _timed(_ask(user, ORDER_TOOL, system=ORDER_SYSTEM, content=content))
+    got = await _timed(_ask(user, ORDER_TOOL, system=ORDER_SYSTEM, content=content, helper=thrifty(user)))
     shop = str(got.get("winkel") or "").strip()[:80]
     day = str(got.get("besteldatum") or "").strip()[:10]
     try:
