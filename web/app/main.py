@@ -621,8 +621,10 @@ class WornIn(BaseModel):
     request_id: str = ""  # the app's id for this save (see _once)
 
 
-def _worn_data(conn, body: WornIn, user: dict) -> tuple[str, dict]:
-    ids = list(dict.fromkeys(i for i in body.item_ids if i in _own_item_ids(conn, user)))
+def _worn_data(conn, body: WornIn, user: dict, previous_snapshots: list[dict] | None = None) -> tuple[str, dict]:
+    previous = {snap.get("id"): snap for snap in previous_snapshots or [] if isinstance(snap, dict) and snap.get("id")}
+    rows = {row["id"]: row for row in conn.execute("SELECT id, data FROM items WHERE user_id = ?", (user["id"],))}
+    ids = list(dict.fromkeys(i for i in body.item_ids if i in rows or i in previous))
     if not ids:
         raise HTTPException(400, "Kies minstens één kledingstuk.")
     day = body.date.strip() or date.today().isoformat()
@@ -631,7 +633,15 @@ def _worn_data(conn, body: WornIn, user: dict) -> tuple[str, dict]:
     except ValueError:
         raise HTTPException(400, "Geef een geldige datum.")
     rating = body.rating if body.rating and 1 <= body.rating <= 5 else None
-    return day[:10], {"item_ids": ids, "occasion": body.occasion.strip()[:200], "note": body.note.strip()[:2000], "rating": rating}
+    snapshots = []
+    for item_id in ids:
+        if item_id in previous:
+            snapshots.append(previous[item_id])
+        else:
+            item = json.loads(rows[item_id]["data"])
+            snapshots.append({key: item[key] for key in ("name", "category", "kind", "colors", "brand") if key in item} | {"id": item_id})
+    return day[:10], {"item_ids": ids, "item_snapshots": snapshots, "occasion": body.occasion.strip()[:200],
+                      "note": body.note.strip()[:2000], "rating": rating}
 
 
 @app.post("/api/worn")
@@ -651,9 +661,11 @@ def _add_worn(body: WornIn, user: dict) -> dict:
 @app.put("/api/worn/{log_id}")
 def update_worn(log_id: str, body: WornIn, user: User):
     with db.connect() as conn:
-        if not conn.execute("SELECT 1 FROM worn WHERE id = ? AND user_id = ?", (log_id, user["id"])).fetchone():
+        row = conn.execute("SELECT data FROM worn WHERE id = ? AND user_id = ?", (log_id, user["id"])).fetchone()
+        if not row:
             raise HTTPException(404, "Outfit niet gevonden.")
-        day, data = _worn_data(conn, body, user)
+        old_data = json.loads(row["data"])
+        day, data = _worn_data(conn, body, user, old_data.get("item_snapshots"))
         conn.execute("UPDATE worn SET date = ?, data = ? WHERE id = ?", (day, json.dumps(data), log_id))
         return db.worn_row(conn.execute("SELECT * FROM worn WHERE id = ?", (log_id,)).fetchone())
 

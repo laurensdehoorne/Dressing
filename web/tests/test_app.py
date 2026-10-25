@@ -109,6 +109,20 @@ def test_worn_only_with_own_items(client):
     assert client.post("/api/worn", json={"item_ids": ["X"]}, headers=H).status_code == 400
 
 
+def test_worn_history_keeps_item_snapshots_after_item_deletion(client):
+    item = add(client, name="Groene linnen blouse", colors=["groen"], brand="Atelier")
+    worn = client.post("/api/worn", json={"item_ids": [item["id"]], "occasion": "zomerfeest"}, headers=H).json()
+    assert worn["item_snapshots"] == [{"id": item["id"], "name": "Groene linnen blouse", "category": "top",
+                                        "colors": ["groen"], "brand": "Atelier"}]
+    assert client.delete(f"/api/items/{item['id']}", headers=H).status_code == 200
+    saved = client.get("/api/state").json()["worn"][0]
+    assert saved["item_ids"] == [item["id"]]
+    assert saved["item_snapshots"][0]["name"] == "Groene linnen blouse"
+    edited = client.put(f"/api/worn/{worn['id']}", json={"item_ids": worn["item_ids"], "occasion": "tuinfeest"}, headers=H).json()
+    assert edited["occasion"] == "tuinfeest"
+    assert edited["item_snapshots"][0]["name"] == "Groene linnen blouse"
+
+
 def test_stylist_gets_only_what_is_in_the_dressing(client, monkeypatch):
     here, washing = add(client, name="Wit hemd"), add(client, name="Vuile jeans", category="broek", status="was")
     client.post("/api/worn", json={"item_ids": [here["id"]], "rating": 5, "note": "top"}, headers=H)

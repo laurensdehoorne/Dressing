@@ -845,8 +845,12 @@ function renderWorn() {
 }
 
 function logRow(l) {
-  const items = (l.item_ids || []).map(itemById).filter(Boolean);
-  const names = items.map((i) => i.name).join(" + ") || "Verwijderde kleren";
+  const snapshots = new Map((l.item_snapshots || []).map((i) => [i.id, i]));
+  const items = (l.item_ids || []).map((id) => {
+    const current = itemById(id), snapshot = snapshots.get(id);
+    return current ? { ...current, name: snapshot?.name || current.name } : snapshot;
+  }).filter(Boolean);
+  const names = items.map((i) => i.name || i.kind || "Kledingstuk").join(" + ") || "Verwijderde kleren";
   return `<button class="log" data-act="open-log" data-id="${h(l.id)}"><span class="stack">${items.slice(0, 4).map((i) => (i.photo ? `<img src="${h(small(i.photo))}" alt="">` : `<span class="ph"></span>`)).join("")}</span>
     <span class="grow" style="min-width:0"><span class="name">${h(longDate(l.date))}</span>
       <span class="sub" style="display:block">${l.rating ? `<span class="stars">${"★".repeat(l.rating)}</span> ` : ""}${h([l.occasion, names].filter(Boolean).join(" · "))}</span></span></button>`;
