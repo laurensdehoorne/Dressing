@@ -837,9 +837,13 @@ function renderWorn() {
     <p>Zeg wat je aantrok: zo weet de stylist wat je graag draagt en wat al te lang in de kast hangt.</p>
     <button class="btn-primary empty-action" data-act="new-outfit">Outfit van vandaag</button></div>`;
   const byMonth = {};
-  for (const l of S.worn) (byMonth[l.date.slice(0, 7)] ||= []).push(l);
+  const visible = ui.wornMonth ? S.worn.filter((l) => l.date.slice(0, 7) === ui.wornMonth) : S.worn;
+  for (const l of visible) (byMonth[l.date.slice(0, 7)] ||= []).push(l);
   const never = S.items.filter((i) => !away(i) && !wearOf(i.id).count).length;
   return `<h1 class="large">Gedragen</h1>
+    <div class="card" style="padding:12px"><div class="row"><div class="field grow" style="margin:0"><label for="worn-month">Bekijk een maand</label><input id="worn-month" type="month" value="${h(ui.wornMonth || "")}" data-act-change="worn-month"></div>
+      <button class="btn-secondary" style="width:auto;padding:8px;font-size:.9rem;white-space:nowrap" data-act="worn-last-year">Jaar terug</button><button class="btn-secondary" style="width:auto;padding:8px;font-size:.9rem" data-act="worn-all">Alles</button></div></div>
+    ${ui.wornMonth && !visible.length ? `<p class="empty">Geen outfits in ${h(new Date(`${ui.wornMonth}-15T12:00:00`).toLocaleDateString("nl-BE", { month: "long", year: "numeric" }))}.</p>` : ""}
     ${never ? `<p class="subtitle">${plural(never, "stuk hangt", "stukken hangen")} er nog ongedragen bij.</p>` : ""}
     ${Object.entries(byMonth).map(([month, logs]) => `<h2 class="section-title">${h(new Date(`${month}-15T12:00:00`).toLocaleDateString("nl-BE", { month: "long", year: "numeric" }))}</h2>
       <div class="card">${logs.map(logRow).join("")}</div>`).join("")}`;
@@ -1301,6 +1305,13 @@ const actions = {
     if (ok) { stack = []; if (!page.logId) ui.tab = "worn"; render(); toast(page.logId ? "Bewaard" : "Genoteerd in Gedragen"); }
   },
   "open-log": (el) => openLog(el.dataset.id),
+  "worn-last-year": () => {
+    const base = ui.wornMonth ? new Date(`${ui.wornMonth}-15T12:00:00`) : new Date();
+    base.setFullYear(base.getFullYear() - 1);
+    ui.wornMonth = `${base.getFullYear()}-${String(base.getMonth() + 1).padStart(2, "0")}`;
+    render();
+  },
+  "worn-all": () => { ui.wornMonth = ""; render(); },
   async "delete-log"() {
     const page = stack.at(-1);
     if (!confirm("Deze outfit verwijderen uit Gedragen?")) return;
@@ -1598,6 +1609,7 @@ const changes = {
     if (files.length) addInspiration(stack.at(-1), files);
   },
   "use-weather": (el) => { ui.stylist.useWeather = el.checked; },
+  "worn-month": (el) => { ui.wornMonth = el.value; render(); },
   async "background-ai-off"(el) {
     const config = S.background_ai || { enabled: true, interval_days: 30 };
     if (await mutate(() => api("/api/settings/background-ai", { method: "PUT", json: { enabled: !el.checked, interval_days: config.interval_days || 30 } }))) toast(el.checked ? "Achtergrond-AI uitgeschakeld" : "Achtergrond-AI ingeschakeld");
