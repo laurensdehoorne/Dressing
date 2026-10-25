@@ -408,7 +408,6 @@ def _short(text: str, limit: int) -> str:
 _BOTTOMS = {"broek", "rok"}
 _TOPS = {"top", "trui", "blazer", "sport"}
 _ONE_OF = {"broek": "broeken", "rok": "rokken", "kleed": "kleedjes", "jas": "jassen", "schoenen": "paar schoenen"}
-RECENT_DAYS = 14  # what was worn in the last two weeks goes to the stylist, rated or not, to alternate
 
 
 async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[dict], *, weather: str = "",
@@ -436,15 +435,13 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         if not available:
             raise ClaudeError("Er hangt nog niets in je dressing (of alles is in de was). Voeg eerst kledingstukken toe.")
     names = {i["id"]: i.get("name") or i.get("kind") or "" for i in items}
-    # The last two weeks in full (to alternate), older outfits only when they say how they went.
-    recent = (date.today() - timedelta(days=RECENT_DAYS)).isoformat()
+    # Keep the complete worn history in the stylist context so it can learn from every outfit.
     taste = []
     for log in sorted(worn, key=lambda l: l["date"], reverse=True):
-        if len(taste) == 25:
-            break
-        if log["date"][:10] < recent and not (log.get("rating") or log.get("note") or log.get("occasion")):
-            continue
-        line = f"{log['date'][:10]}: " + " + ".join(names.get(i, "?") for i in log.get("item_ids", []))
+        context = [log.get("season")] if log.get("season") else []
+        if log.get("temperature") is not None:
+            context.append(f"{log['temperature']}°C")
+        line = f"{log['date'][:10]} ({', '.join(context)}): " + " + ".join(names.get(i, "?") for i in log.get("item_ids", []))
         if log.get("occasion"):
             line += f" ({log['occasion']})"
         if log.get("rating"):

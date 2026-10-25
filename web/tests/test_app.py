@@ -109,6 +109,18 @@ def test_worn_only_with_own_items(client):
     assert client.post("/api/worn", json={"item_ids": ["X"]}, headers=H).status_code == 400
 
 
+def test_worn_logs_season_temperature_and_preserves_temperature_when_edited(client):
+    item = add(client)
+    worn = client.post("/api/worn", json={"item_ids": [item["id"]], "date": "2026-07-12", "temperature": 21.5,
+                                            "occasion": "terras"}, headers=H)
+    assert worn.status_code == 200, worn.text
+    assert worn.json()["season"] == "zomer" and worn.json()["temperature"] == 21.5
+    edited = client.put(f"/api/worn/{worn.json()['id']}", json={"item_ids": [item["id"]], "date": "2026-07-12",
+                                                                "occasion": "lunch"}, headers=H)
+    assert edited.status_code == 200 and edited.json()["temperature"] == 21.5
+    assert client.post("/api/worn", json={"item_ids": [item["id"]], "temperature": 100}, headers=H).status_code == 400
+
+
 def test_worn_history_keeps_item_snapshots_after_item_deletion(client):
     item = add(client, name="Groene linnen blouse", colors=["groen"], brand="Atelier")
     worn = client.post("/api/worn", json={"item_ids": [item["id"]], "occasion": "zomerfeest"}, headers=H).json()
@@ -833,7 +845,7 @@ def test_stylist_sees_what_a_piece_is_for_and_what_was_worn_lately(client, monke
     client.post("/api/rejected", json={"item_ids": [hemd["id"], jeans["id"]], "reasons": ["Kleuren botsen"]}, headers=H)
     client.post("/api/rejected", json={"item_ids": [hemd["id"]], "reasons": ["Draag ik niet graag"]}, headers=H)
     lately, long_ago = (date.today() - timedelta(days=3)).isoformat(), (date.today() - timedelta(days=60)).isoformat()
-    for day, data in ((lately, {}), (long_ago, {}), (long_ago, {"rating": 5})):
+    for day, data in ((lately, {"temperature": 8.5, "occasion": "kantoor"}), (long_ago, {}), (long_ago, {"rating": 5})):
         r = client.post("/api/worn", json={"item_ids": [jeans["id"]], "date": day, **data}, headers=H)
         assert r.status_code == 200, r.text
     seen = {}
@@ -848,8 +860,30 @@ def test_stylist_sees_what_a_piece_is_for_and_what_was_worn_lately(client, monke
     assert "2× in een afgewezen outfit" in line
     assert "1× in een afgewezen outfit" in next(l for l in seen["text"].splitlines() if l.startswith(jeans["id"]))
     worn = seen["text"].split("Wat ik eerder droeg en hoe het viel:\n")[1].split("\n\n")[0].splitlines()
-    assert [w[:10] for w in worn] == [lately, long_ago]  # lately, rated or not; long ago only with a score
+    assert [w[:10] for w in worn] == [lately, long_ago, long_ago]  # every prior outfit, including old unrated outfits
+    assert "°C" in worn[0] and "herfst" in worn[0] and "(kantoor)" in worn[0]
     assert claude._short("een twee drie vier", 9) == "een twee…"
+
+
+def test_stylist_includes_every_worn_outfit_past_the_old_history_limit(client, monkeypatch):
+    item = add(client, name="Blauwe trui")
+    from datetime import date, timedelta
+    first_day = date.today() - timedelta(days=200)
+    for n in range(30):
+        day = (first_day + timedelta(days=n)).isoformat()
+        saved = client.post("/api/worn", json={"item_ids": [item["id"]], "date": day}, headers=H)
+        assert saved.status_code == 200, saved.text
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
+        seen["text"] = content[0]["text"]
+        return {"advies": "", "outfits": []}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    result = client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    assert result.status_code == 200, result.text
+    history = seen["text"].split("Wat ik eerder droeg en hoe het viel:\n")[1].split("\n\n")[0].splitlines()
+    assert len(history) == 30
+    assert history[-1].startswith(first_day.isoformat())
 
 
 def test_follow_up_keeps_every_outfit(client, monkeypatch):

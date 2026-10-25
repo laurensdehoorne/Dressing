@@ -7,6 +7,7 @@ import http.client
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -616,6 +617,7 @@ class WornIn(BaseModel):
     item_ids: list[str]
     date: str = ""
     occasion: str = ""
+    temperature: float | None = None
     note: str = ""
     rating: int | None = None
     request_id: str = ""  # the app's id for this save (see _once)
@@ -629,9 +631,12 @@ def _worn_data(conn, body: WornIn, user: dict, previous_snapshots: list[dict] | 
         raise HTTPException(400, "Kies minstens één kledingstuk.")
     day = body.date.strip() or date.today().isoformat()
     try:
-        date.fromisoformat(day[:10])
+        worn_date = date.fromisoformat(day[:10])
     except ValueError:
         raise HTTPException(400, "Geef een geldige datum.")
+    temperature = body.temperature
+    if temperature is not None and (not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or not -80 <= temperature <= 70):
+        raise HTTPException(400, "Geef een geldige temperatuur tussen -80 en 70 °C.")
     rating = body.rating if body.rating and 1 <= body.rating <= 5 else None
     snapshots = []
     for item_id in ids:
@@ -640,7 +645,9 @@ def _worn_data(conn, body: WornIn, user: dict, previous_snapshots: list[dict] | 
         else:
             item = json.loads(rows[item_id]["data"])
             snapshots.append({key: item[key] for key in ("name", "category", "kind", "colors", "brand") if key in item} | {"id": item_id})
-    return day[:10], {"item_ids": ids, "item_snapshots": snapshots, "occasion": body.occasion.strip()[:200],
+    return day[:10], {"item_ids": ids, "item_snapshots": snapshots, "season": claude.season(worn_date),
+                      "temperature": round(float(temperature), 1) if temperature is not None else None,
+                      "occasion": body.occasion.strip()[:200],
                       "note": body.note.strip()[:2000], "rating": rating}
 
 
@@ -665,6 +672,8 @@ def update_worn(log_id: str, body: WornIn, user: User):
         if not row:
             raise HTTPException(404, "Outfit niet gevonden.")
         old_data = json.loads(row["data"])
+        if body.temperature is None and old_data.get("temperature") is not None:
+            body = body.model_copy(update={"temperature": old_data["temperature"]})
         day, data = _worn_data(conn, body, user, old_data.get("item_snapshots"))
         conn.execute("UPDATE worn SET date = ?, data = ? WHERE id = ?", (day, json.dumps(data), log_id))
         return db.worn_row(conn.execute("SELECT * FROM worn WHERE id = ?", (log_id,)).fetchone())

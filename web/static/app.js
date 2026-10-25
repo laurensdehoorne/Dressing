@@ -853,7 +853,7 @@ function logRow(l) {
   const names = items.map((i) => i.name || i.kind || "Kledingstuk").join(" + ") || "Verwijderde kleren";
   return `<button class="log" data-act="open-log" data-id="${h(l.id)}"><span class="stack">${items.slice(0, 4).map((i) => (i.photo ? `<img src="${h(small(i.photo))}" alt="">` : `<span class="ph"></span>`)).join("")}</span>
     <span class="grow" style="min-width:0"><span class="name">${h(longDate(l.date))}</span>
-      <span class="sub" style="display:block">${l.rating ? `<span class="stars">${"★".repeat(l.rating)}</span> ` : ""}${h([l.occasion, names].filter(Boolean).join(" · "))}</span></span></button>`;
+      <span class="sub" style="display:block">${l.rating ? `<span class="stars">${"★".repeat(l.rating)}</span> ` : ""}${h([[l.season, l.temperature == null ? "" : `${l.temperature}°C`].filter(Boolean).join(" · "), l.occasion, names].filter(Boolean).join(" · "))}</span></span></button>`;
 }
 
 function renderOutfit(page) {
@@ -864,6 +864,7 @@ function renderOutfit(page) {
       <button class="btn-pill strong primary" data-act="save-outfit" ${chosen.size && !page.saving ? "" : "disabled"}>Bewaar</button></div>
     <div class="card">
       <div class="field"><label for="o-date">Datum</label><input id="o-date" type="date" data-bind="date" value="${h(d.date)}" max="${today()}"></div>
+      <div class="field"><label for="o-temp">Temperatuur bij het dragen (°C)</label><input id="o-temp" type="number" inputmode="decimal" step="0.1" min="-80" max="70" data-bind="temperature" value="${d.temperature ?? ""}" placeholder="optioneel"></div>
       <div class="field"><label for="o-occ">Gelegenheid</label><input id="o-occ" data-bind="occasion" value="${h(d.occasion)}" placeholder="bv. kantoor, verjaardag"></div>
       <div class="field"><span class="label">Hoe voelde het?</span><div class="star-pick">${[1, 2, 3, 4, 5].map((n) => `<button type="button" data-act="rate" data-value="${n}" aria-pressed="${(d.rating || 0) >= n}" aria-label="${n} op 5">★</button>`).join("")}</div></div>
       <div class="field"><label for="o-note">Notitie</label><input id="o-note" data-bind="note" value="${h(d.note)}" placeholder="bv. te warm, veel complimentjes"></div></div>
@@ -874,7 +875,8 @@ function renderOutfit(page) {
 }
 
 function openOutfit(ids = [], extra = {}) {
-  push({ kind: "outfit", draft: { item_ids: [...ids], date: today(), occasion: "", note: "", rating: null, ...extra } });
+  const temperature = !onTrip() && Number.isFinite(ui.weather?.current?.temp) ? ui.weather.current.temp : null;
+  push({ kind: "outfit", draft: { item_ids: [...ids], date: today(), occasion: "", note: "", rating: null, temperature, ...extra } });
 }
 
 // MARK: - Sign-in
@@ -1198,7 +1200,7 @@ function viewPhoto(src) {
 function openLog(id) {
   const l = S.worn.find((x) => x.id === id);
   if (!l) return toast("Deze outfit staat niet meer in Gedragen.");
-  push({ kind: "outfit", logId: l.id, draft: { item_ids: [...l.item_ids], date: l.date, occasion: l.occasion || "", note: l.note || "", rating: l.rating || null } });
+  push({ kind: "outfit", logId: l.id, draft: { item_ids: [...l.item_ids], date: l.date, occasion: l.occasion || "", note: l.note || "", rating: l.rating || null, temperature: l.temperature ?? null } });
 }
 
 /** What a notification is about: "gedragen=<id>" opens that outfit to give it a score. */
@@ -1282,8 +1284,9 @@ const actions = {
     if (page.saving) return;
     page.saving = true;
     if (!page.logId) page.requestId ||= requestId();
+    const draft = { ...page.draft, temperature: page.draft.temperature === "" || page.draft.temperature == null ? null : Number(page.draft.temperature) };
     const ok = await mutate(() => api(page.logId ? `/api/worn/${page.logId}` : "/api/worn",
-      { method: page.logId ? "PUT" : "POST", json: { ...page.draft, request_id: page.logId ? "" : page.requestId } }));
+      { method: page.logId ? "PUT" : "POST", json: { ...draft, request_id: page.logId ? "" : page.requestId } }));
     page.saving = false;
     if (ok) { stack = []; if (!page.logId) ui.tab = "worn"; render(); toast(page.logId ? "Bewaard" : "Genoteerd in Gedragen"); }
   },

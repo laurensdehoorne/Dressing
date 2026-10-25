@@ -40,7 +40,8 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   hij uit van het gebruikelijke weer daar). Vanaf de dag voor vertrek staat de reis vanzelf aan. Terug thuis maak je de
   valies leeg.
 - **Gedragen**: noteer wat je droeg (vanuit een voorstel, bij een stuk of zelf samengesteld), met datum,
-  gelegenheid, sterren en notitie. Bij elk stuk zie je hoe vaak en wanneer het laatst gedragen werd.
+  seizoen, temperatuur, gelegenheid, sterren en notitie. De stylist gebruikt die geschiedenis bij volgende voorstellen;
+  de temperatuur wordt ingevuld als het lokale weer beschikbaar is en kan je zelf aanpassen.
 - **Outfit rond dit stuk**: vanuit een kledingstuk meteen een outfit eromheen vragen.
 - **Inspiratie**: bewaar outfits die je mooi vindt op Instagram of Pinterest, met tot 6 screenshots tegelijk of de link van
   een pin (de server haalt de foto van de pin op; bij Instagram lukt dat zonder aanmelden niet, daar neem je een screenshot). De
