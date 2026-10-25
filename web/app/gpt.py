@@ -16,8 +16,9 @@ from . import auth, costs, keys
 from .claude import TOO_SLOW, ClaudeError, Helpers, run_helper, thrifty
 
 # Which model does what: Luna recognises photos and puts everyday outfits together; Sol takes a dress code or a look
-# to recreate; Astra takes a second try when an answer failed its check; Flare draws an outfit. A model the account
-# picked under Instellingen wins over Sol and Astra, and Zuinig keeps everything on Luna (but the picture).
+# to recreate; Astra takes a second try when an answer failed its check; Flare draws an outfit. That routing only
+# happens on Luna (the default model) and when the account leaves it on "auto" (ROUTING): an account can keep Luna as a
+# fixed model. Another model picked under Instellingen, or Zuinig, keeps everything on one model (but the picture).
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
 HELPER_MODEL = os.environ.get("OPENAI_HELPER_MODEL", "gpt-6-luna")  # the cheap model of "Zuinig"
 COMPLEX_MODEL = os.environ.get("OPENAI_COMPLEX_MODEL", "gpt-6.1-sol")
@@ -33,13 +34,28 @@ def model(user: dict) -> str:
     return auth.user_settings(user).get("openai_model") or DEFAULT_MODEL
 
 
+# auto: the stylist may hand a dress code to Sol and a second try to Astra; fixed: the account's model does it all.
+ROUTING = {"auto": "Automatisch", "fixed": "Vast model"}
+DEFAULT_ROUTING = "auto"  # as before this choice existed
+
+
+def routing(user: dict) -> str:
+    """What this account chose: may the stronger models step in ("auto") or not ("fixed")."""
+    chosen = auth.user_settings(user).get("openai_routing")
+    return chosen if chosen in ROUTING else DEFAULT_ROUTING
+
+
+def routes(user: dict) -> bool:
+    """Whether Sol and Astra really step in for this account: only on the default model (Luna), with "auto", and not
+    with Zuinig. Another chosen model is stronger or dearer already and stays the one model."""
+    return model(user) == DEFAULT_MODEL and routing(user) == "auto" and not thrifty(user)
+
+
 def model_for(user: dict, tier: str) -> str:
     """The model for one kind of work: "complex" (a dress code, a look to recreate) or "review" (a second try after
-    a failed check); anything else is the account's model."""
+    a failed check) when the account routes; anything else is the account's model."""
     upgrade = {"complex": COMPLEX_MODEL, "review": REVIEW_MODEL}.get(tier)
-    if not upgrade or model(user) != DEFAULT_MODEL or thrifty(user):
-        return model(user)
-    return upgrade
+    return upgrade if upgrade and routes(user) else model(user)
 
 
 def client(user: dict) -> openai.AsyncOpenAI:
@@ -94,12 +110,19 @@ def _usable(model_id: str) -> bool:
 
 
 async def list_models(user: dict) -> list[dict]:
+    """The models this key can use, the recommended ones first: those that passed the live check of model_check
+    (a photo, a function call, reasoning effort, cache breakpoints). The others are listed as not tested."""
+    from . import model_check
     try:
         models = [m async for m in client(user).models.list() if _usable(m.id)]
     except openai.OpenAIError as e:
         raise _error(e)
-    models.sort(key=lambda m: m.created or 0, reverse=True)
-    return [{"id": m.id, "name": m.id} for m in models]
+    checked = model_check.results()
+    models.sort(key=lambda m: (not model_check.passed(checked.get(m.id)), -(m.created or 0)))
+    return [{"id": m.id, "name": m.id, "recommended": model_check.passed(checked.get(m.id)),
+             "checked": (checked.get(m.id) or {}).get("checked"),
+             "failed": [label for f, label in model_check.FEATURES.items() if (checked.get(m.id) or {}).get(f) is False]}
+            for m in models]
 
 
 async def check_key(key: str) -> None:
@@ -207,6 +230,8 @@ async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: l
         except ClaudeError:
             raise
         except openai.OpenAIError as e:
+            if isinstance(e, openai.APITimeoutError):
+                costs.lost("openai", name, costs.TIMED_OUT)
             raise _error(e)
         costs.track_openai(name, response)
         if (found := _function_input(response, tool_name)) is not None:
@@ -271,6 +296,8 @@ async def draw_outfit(user: dict, pieces: list[tuple[str, bytes | None]]) -> byt
             raise ClaudeError("ChatGPT wilde dit beeld niet maken. Probeer een ander outfit.")
         raise _error(e)
     except openai.OpenAIError as e:
+        if isinstance(e, openai.APITimeoutError):
+            costs.lost("openai", IMAGE_MODEL, costs.TIMED_OUT)
         raise _error(e)
     costs.track_openai_image(IMAGE_MODEL, response)
     data = response.data[0].b64_json if response.data else None

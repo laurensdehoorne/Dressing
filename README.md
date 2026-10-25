@@ -54,9 +54,15 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   ChatGPT loopt via de Responses API van OpenAI.
 - **Bij ChatGPT kiest de stylist zelf het model**: `gpt-6-luna` herkent foto's en stelt gewone outfits samen,
   `gpt-6.1-sol` neemt een dresscode of een look om na te maken (huwelijk, sollicitatie, cocktail, …), en `gpt-6-astra`
-  krijgt een tweede kans als een antwoord niet door de controle raakt (een onbekend stuk, geen schoenen). Kies je zelf
-  een model bij Instellingen, of *Zuinig*, dan doet dat ene model alles. Sol kost ongeveer 20 keer zoveel als Luna,
-  Astra ongeveer 100 keer.
+  krijgt een tweede kans als een antwoord niet door de controle raakt (een onbekend stuk, geen schoenen). Op Luna kies
+  je bij Instellingen *Automatisch* (zo) of *Vast model* (Luna doet alles, Sol en Astra komen er niet aan te pas). Kies je
+  een ander model, of *Zuinig*, dan doet dat ene model alles. Sol kost ongeveer 20 keer zoveel als Luna, Astra ongeveer
+  100 keer.
+- **Aanbevolen modellen** bij *Ander model kiezen* zijn enkel modellen die de live modelcontrole doorstonden (zie
+  *Ontwikkelen*): een foto lezen, een functie aanroepen, een reasoning-instelling aannemen en prompt caching melden.
+  De andere staan erbij als niet getest.
+- **AI-kosten** bij Instellingen: per model (elke oproep één keer, bij het model dat ze beantwoordde) en per analyse.
+  ≥ betekent dat een deel niet geprijsd kon worden, ? dat niets bekend is.
 - **Toon als beeld**: bij elk voorgesteld outfit kan je met een knop een beeld laten tekenen van iemand die het draagt
   (`gpt-image-2.5-flare`, naar de foto's van je eigen stukken). Enkel als je erop tikt, en enkel met een OpenAI-sleutel;
   het beeld wordt niet bewaard.
@@ -118,3 +124,13 @@ DATA_DIR=data .venv/bin/uvicorn app.main:app --reload --port 8766
 ```
 
 De tests vervangen de AI en het weer door nepversies; ze kosten niets.
+
+De live modelcontrole stuurt per OpenAI-model twee kleine vragen zoals de app ze stelt, en bewaart het resultaat in
+`data/openai_models.json`. Ze kost een fractie van een cent op Luna en enkele centen op Astra:
+
+```bash
+cd web
+OPENAI_API_KEY=sk-... DATA_DIR=data .venv/bin/python -m app.model_check
+```
+
+In de container: `docker compose exec dressing python -m app.model_check` (met `OPENAI_API_KEY` in `.env`).

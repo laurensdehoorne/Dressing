@@ -45,19 +45,22 @@ PRICES = {
                              "long_context": {"above": 100_000, "input": 5.0, "output": 5.0}},
         "claude-haiku-4-5": {"input": 1.0, "cached": 0.10, "cache_write": 1.25, "cache_write_1h": 2.0, "output": 5.0},
     },
-    # OpenAI's pricing page (developers.openai.com/api/docs/pricing), Standard tier, checked October 2026. Above 272K
-    # input tokens a whole request costs 2x the input and cache prices and 1.5x the output price.
+    # OpenAI's pricing page (developers.openai.com/api/docs/pricing), Standard tier, checked 25 October 2026. Above 272K
+    # input tokens a whole request costs 2x the input and cache prices and 1.5x the output price. Cache writes have two
+    # lifetimes: cache_write is the 30-minute kind the app asks for (the default), cache_write_12h the 12-hour kind.
+    # Reasoning tokens are part of output_tokens and billed as output.
     "openai": {
-        "gpt-6-astra": {"input": 10.0, "cached": 1.0, "cache_write": 12.50, "output": 50.0,
+        "gpt-6-astra": {"input": 10.0, "cached": 1.0, "cache_write": 12.50, "cache_write_12h": 25.0, "output": 50.0,
                         "long_context": {"above": 272_000, "input": 2.0, "output": 1.5}},
-        # An image model: text and photos in at their own price, the picture out. Cached input only counts in the
-        # Responses API, which the app doesn't use for pictures.
+        # An image model: text and photos in at their own price, the picture out (no separate price for text out: all
+        # output is billed as image output). Cached input only counts in the Responses API, which the app doesn't use
+        # for pictures.
         "gpt-image-2.5-flare": {"input": 5.0, "image_input": 8.0, "output": 30.0},
-        "gpt-6-luna": {"input": 0.10, "cached": 0.01, "cache_write": 0.125, "output": 0.50,
+        "gpt-6-luna": {"input": 0.10, "cached": 0.01, "cache_write": 0.125, "cache_write_12h": 0.25, "output": 0.50,
                        "long_context": {"above": 272_000, "input": 2.0, "output": 1.5}},
-        "gpt-6.1-sol": {"input": 2.0, "cached": 0.10, "cache_write": 2.50, "output": 10.0,
+        "gpt-6.1-sol": {"input": 2.0, "cached": 0.10, "cache_write": 2.50, "cache_write_12h": 5.0, "output": 10.0,
                         "long_context": {"above": 272_000, "input": 2.0, "output": 1.5}},
-        "gpt-6-sol": {"input": 2.0, "cached": 0.20, "cache_write": 2.50, "output": 10.0,
+        "gpt-6-sol": {"input": 2.0, "cached": 0.20, "cache_write": 2.50, "cache_write_12h": 5.0, "output": 10.0,
                       "long_context": {"above": 272_000, "input": 2.0, "output": 1.5}},
     },
 }
@@ -107,6 +110,7 @@ class Call:
     cached_input_tokens: int = 0  # read from the cache
     cache_write_tokens: int = 0  # written to the cache (all kinds)
     cache_write_1h_tokens: int = 0  # of those, Anthropic's 1-hour cache
+    cache_write_12h_tokens: int = 0  # of those, OpenAI's 12-hour cache
     output_tokens: int = 0  # reasoning included: billed as output
     cost_usd: float = 0.0
     # estimated: all usage and prices known · partial: a part couldn't be priced or wasn't reported (listed in
@@ -145,8 +149,10 @@ def _priced(call: Call) -> Call:
     plain = max(call.input_tokens - call.cached_input_tokens - call.cache_write_tokens, 0)
     cost = plain * p["input"] * f_in + call.output_tokens * p["output"] * f_out
     for tokens, key, label in ((call.cached_input_tokens, "cached", "prijs van cached input"),
-                               (call.cache_write_tokens - call.cache_write_1h_tokens, "cache_write", "prijs van cache writes"),
-                               (call.cache_write_1h_tokens, "cache_write_1h", "prijs van 1-uur cache writes")):
+                               (call.cache_write_tokens - call.cache_write_1h_tokens - call.cache_write_12h_tokens,
+                                "cache_write", "prijs van cache writes"),
+                               (call.cache_write_1h_tokens, "cache_write_1h", "prijs van 1-uur cache writes"),
+                               (call.cache_write_12h_tokens, "cache_write_12h", "prijs van 12-uur cache writes")):
         if tokens and key in p:
             cost += tokens * p[key] * f_in
         elif tokens:
@@ -188,7 +194,9 @@ def anthropic_calls(requested: str, served: str, usage) -> list[Call]:
 
 def from_openai(model: str, usage, service_tier: str | None = None) -> Call:
     """OpenAI's Responses API usage: input_tokens is the whole prompt; input_tokens_details.cached_tokens and
-    .cache_write_tokens are parts of it; output_tokens includes the reasoning tokens."""
+    .cache_write_tokens are parts of it that don't overlap (a read is never also charged as a write), and
+    .cache_write_tokens_details splits the writes by lifetime (ttl_30m_tokens, ttl_12h_tokens); output_tokens includes
+    the reasoning tokens."""
     call = Call("openai", model)
     inp, out = _count(usage, "input_tokens"), _count(usage, "output_tokens")
     if inp is None or out is None:
@@ -198,6 +206,8 @@ def from_openai(model: str, usage, service_tier: str | None = None) -> Call:
     details = _get(usage, "input_tokens_details")
     cached, written = _count(details, "cached_tokens"), _count(details, "cache_write_tokens")
     call.cached_input_tokens, call.cache_write_tokens = cached or 0, written or 0
+    # Without the split, writes are the 30-minute kind: the app never asks for another lifetime.
+    call.cache_write_12h_tokens = min(_count(_get(details, "cache_write_tokens_details"), "ttl_12h_tokens") or 0, call.cache_write_tokens)
     call = _priced(call)
     if cached is None:
         _flag(call, "cached tokens niet gerapporteerd")
@@ -271,8 +281,12 @@ def track_openai_image(requested: str, response) -> None:
         record(Call("openai", requested, status="unknown", missing=["kost kon niet berekend worden"]))
 
 
+TIMED_OUT = "geen antwoord binnen de tijd: mogelijk toch aangerekend"
+
+
 def lost(provider: str, model: str, reason: str) -> None:
-    """A call that was sent but never answered (cut off after too long): it may be billed, its usage is unknown."""
+    """A call that was sent but never answered (cut off after too long, or the connection timed out): it may be
+    billed, its usage is unknown. Kept as a call of that model with an unknown cost, so the analysis is partial."""
     record(Call(provider, model, status="unknown", missing=[reason]))
 
 
@@ -311,25 +325,72 @@ def store(user: dict, task: str, calls: list[Call], *, failed: bool = False) -> 
                          (user["id"], json.dumps([asdict(c) for c in calls]), *(row[k] for k in COLUMNS)))
     except Exception as e:
         print(f"keeping the cost of {task} failed: {e!r}")
-    return row
+    return {**row, "per_model": per_model([asdict(c) for c in calls])}
+
+
+def _row_calls(row: dict) -> list[dict]:
+    """The calls kept with one analysis; one stand-in call from the row's own sums when they can't be read."""
+    try:
+        calls = json.loads(row.get("calls") or "[]")
+    except (TypeError, ValueError):
+        calls = None
+    calls = [c for c in calls if isinstance(c, dict) and c.get("model")] if isinstance(calls, list) else []
+    if calls:
+        return calls
+    return [{"model": row.get("models") or "?", "status": row.get("status") or "unknown", "cost_usd": row.get("cost_usd") or 0,
+             "input_tokens": row.get("input_tokens") or 0, "output_tokens": row.get("output_tokens") or 0}]
+
+
+def per_model(calls: list[dict]) -> list[dict]:
+    """The calls added up per model id, dearest first. Every call counts once, for the model that answered it, so the
+    models together add up to the analyses' total. status as for an analysis: estimated, partial or unknown."""
+    models: dict[str, dict] = {}
+    for c in calls:
+        m = models.setdefault(c["model"], {"model": c["model"], "calls": 0, "cost_usd": 0.0, "input_tokens": 0,
+                                           "output_tokens": 0, "statuses": []})
+        m["calls"] += 1
+        m["cost_usd"] += c.get("cost_usd") or 0
+        m["input_tokens"] += c.get("input_tokens") or 0
+        m["output_tokens"] += c.get("output_tokens") or 0
+        m["statuses"].append(c.get("status") or "unknown")
+    out = []
+    for m in models.values():
+        statuses = m.pop("statuses")
+        out.append({**m, "cost_usd": round(m["cost_usd"], 8), "cost_eur": round(m["cost_usd"] * USD_TO_EUR, 6),
+                    "status": _status(statuses)})
+    return sorted(out, key=lambda m: -m["cost_usd"])
 
 
 def overview(conn, user: dict) -> dict:
-    """This year's analyses for Instellingen: the total, per model, and the latest ones. Starts again on 1 January
-    (local time); earlier years stay in the database."""
+    """This year's analyses for Instellingen: the total, per model id (from the calls each analysis kept, so an
+    analysis that used two models counts each model's own share), and the latest analyses with their models. Starts
+    again on 1 January (local time); earlier years stay in the database."""
     year = datetime.now().astimezone()
     start = year.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
-    rows = [dict(r) for r in conn.execute(f"SELECT {', '.join(COLUMNS)} FROM ai_usage WHERE user_id = ? AND at >= ? ORDER BY at DESC",
+    rows = [dict(r) for r in conn.execute(f"SELECT {', '.join(COLUMNS)}, calls FROM ai_usage WHERE user_id = ? AND at >= ? ORDER BY at DESC",
                                           (user["id"], start))]
-    per_model: dict[str, dict] = {}
+    models: dict[str, dict] = {}
     for r in rows:
-        m = per_model.setdefault(r["models"], {"models": r["models"], "count": 0, "cost_eur": 0.0, "partial": False})
-        m["count"] += 1
-        m["cost_eur"] += r["cost_eur"] or 0
-        m["partial"] |= r["status"] != "estimated"
-    return {"year": year.year, "count": len(rows), "cost_eur": round(sum(r["cost_eur"] or 0 for r in rows), 6),
-            "partial": any(r["status"] != "estimated" for r in rows),
-            "per_model": sorted(per_model.values(), key=lambda m: -m["cost_eur"]), "latest": rows[:10]}
+        calls = _row_calls(r)
+        r["per_model"] = per_model(calls)
+        for m in r["per_model"]:
+            total = models.setdefault(m["model"], {"model": m["model"], "analyses": 0, "calls": 0, "cost_usd": 0.0,
+                                                   "statuses": []})
+            total["analyses"] += 1
+            total["calls"] += m["calls"]
+            total["cost_usd"] += m["cost_usd"]
+            total["statuses"].append(m["status"])
+        del r["calls"]
+    by_model = []
+    for m in models.values():
+        statuses = m.pop("statuses")
+        by_model.append({**m, "cost_usd": round(m["cost_usd"], 8), "cost_eur": round(m["cost_usd"] * USD_TO_EUR, 6),
+                         "status": _status(statuses)})
+    by_model.sort(key=lambda m: -m["cost_usd"])
+    usd = sum(m["cost_usd"] for m in by_model)
+    status = _status(r["status"] for r in rows) if rows else "estimated"
+    return {"year": year.year, "count": len(rows), "cost_usd": round(usd, 8), "cost_eur": round(usd * USD_TO_EUR, 6),
+            "status": status, "partial": status != "estimated", "per_model": by_model, "latest": rows[:10]}
 
 
 _overrides()

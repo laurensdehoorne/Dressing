@@ -168,6 +168,7 @@ async def _ask_claude(user: dict, tool: dict, *, system: str, content: list, eff
         except anthropic.RateLimitError:
             raise ClaudeError("Te veel verzoeken tegelijk. Wacht even en probeer opnieuw.")
         except anthropic.APITimeoutError:
+            costs.lost("anthropic", name, costs.TIMED_OUT)
             raise ClaudeError(TOO_SLOW)
         except anthropic.APIConnectionError:
             raise ClaudeError("De server kan Claude niet bereiken. Controleer de internetverbinding.")

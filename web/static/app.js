@@ -658,13 +658,13 @@ function outfitsHTML(r) {
         <button class="btn-primary" data-act="wear-outfit" data-n="${n}">Dit draag ik</button></div>`}</article>`).join("")}
     ${!r.outfits.length ? `<div class="notice">Geen outfit gevonden die past.</div>` : ""}
     ${r.missing ? `<div class="notice">🛍️ ${h(r.missing)}</div>` : ""}
-    ${r.analysis ? `<p class="footnote" style="text-align:center">Dit antwoord kostte ${r.analysis.status === "estimated" ? "ongeveer" : "minstens"} ${euros(r.analysis.cost_eur)}.</p>` : ""}`;
+    ${r.analysis ? `<p class="footnote" style="text-align:center">${costSentence("Dit antwoord", r.analysis)}</p>` : ""}`;
 }
 
 /** The picture of an outfit, only made when asked with its button (ChatGPT draws it from the photos of the pieces). */
 function pictureHTML(o, n) {
   if (o.picture) return `<img class="outfit-picture" src="${h(o.picture)}" alt="Beeld van ${h(o.title)}">
-    <p class="footnote">Getekend door ${h(S.ai?.image_model || "ChatGPT")} naar de foto's van je stukken: het kan afwijken van hoe ze echt zijn.${o.pictureCost ? ` Dit beeld kostte ${o.pictureCost.status === "estimated" ? "ongeveer" : "minstens"} ${euros(o.pictureCost.cost_eur)}.` : ""}</p>`;
+    <p class="footnote">Getekend door ${h(S.ai?.image_model || "ChatGPT")} naar de foto's van je stukken: het kan afwijken van hoe ze echt zijn.${o.pictureCost ? ` ${costSentence("Dit beeld", o.pictureCost)}` : ""}</p>`;
   if (o.drawing) return `<p class="footnote"><span class="spinner sm"></span> Beeld tekenen…</p>`;
   if (!S.ai?.can_draw) return "";
   return `${o.drawError ? `<div class="notice err">${h(o.drawError)}</div>` : ""}
@@ -937,6 +937,7 @@ function renderSettings() {
       <div class="row"><span class="grow">Model</span><span class="v">${h(service.model)}</span></div>
       ${aiReady() ? `<div class="row"><button class="row-button" data-act="pick-model">Ander model kiezen</button></div>` : ""}
     </div>
+    ${routingSection(service)}
     <div class="pills" role="group" aria-label="Analyse" style="margin:14px 0 0">
       ${[["standaard", "Standaard"], ["zuinig", "Zuinig"]].map(([q, label]) => `<button data-act="set-quality" data-value="${q}" aria-pressed="${(S.ai?.quality || "standaard") === q}">${label}</button>`).join("")}</div>
     <p class="footnote">${qualityNote(service)}</p>
@@ -956,16 +957,30 @@ function renderSettings() {
     <p class="footnote" style="margin-top:24px;text-align:center">Dressing${S.version ? ` · versie ${h(S.version)}` : ""}</p>`;
 }
 
-const TASKS = { herkennen: "Foto herkennen", bestelling: "Bestelling lezen", stylist: "Stylist", inspiratie: "Inspiratie" };
+const TASKS = { herkennen: "Foto herkennen", bestelling: "Bestelling lezen", stylist: "Stylist", inspiratie: "Inspiratie",
+  outfitbeeld: "Outfitbeeld" };
 
-/** What the AI cost this year: an estimate from the tokens each answer reports, times the list price. */
+// ChatGPT on its default model (Luna): may the stylist call in Sol for a dress code and Astra for a second try, or
+// does Luna do it all. Another model is always one fixed model; Zuinig keeps it on Luna whatever is chosen here.
+function routingSection(service) {
+  if (aiProvider() !== "openai" || service.model !== service.default_model) return "";
+  const auto = S.ai?.routing !== "fixed", m = h(service.model);
+  const note = S.ai?.quality === "zuinig" ? `Zuinig staat aan: zolang dat zo is, doet ${m} alles, ook met Automatisch.`
+    : auto ? `Automatisch: ${m} doet het gewone werk. Voor een dresscode of een look om na te maken zet de stylist ${h(S.ai.complex_model)} in,
+      en als een antwoord niet door de controle raakt krijgt ${h(S.ai.review_model)} een tweede kans. Die kosten meer per antwoord.`
+    : `Vast model: ${m} doet alles, ook een dresscode en een tweede poging. ${h(S.ai.complex_model)} en ${h(S.ai.review_model)} komen er niet aan te pas.`;
+  return `<div class="pills" role="group" aria-label="Sterkere modellen" style="margin:14px 0 0">
+      ${[["auto", "Automatisch"], ["fixed", "Vast model"]].map(([v, label]) => `<button data-act="set-routing" data-value="${v}" aria-pressed="${(auto ? "auto" : "fixed") === v}">${label}</button>`).join("")}</div>
+    <p class="footnote">${note}</p>`;
+}
+
 // What Standaard and Zuinig really do for this service. Recognising a photo and reading an order or inspiration only
 // gets cheaper when the helper model differs from the account's; at ChatGPT, Zuinig also keeps the stylist from
 // calling in its stronger models for a dress code or a second try.
 function qualityNote(service) {
   const thrifty = S.ai?.quality === "zuinig", m = h(service.model), helper = h(service.helper_model);
   const cheaperHelper = service.helper_model !== service.model;
-  const upgrades = aiProvider() === "openai" && service.model === service.default_model;
+  const upgrades = aiProvider() === "openai" && service.model === service.default_model && S.ai?.routing !== "fixed";
   const reading = "een foto herkennen en een bestelling of inspiratie lezen";
   if (thrifty) {
     const parts = [cheaperHelper ? `${reading} doet het goedkopere ${helper}` : `${reading} doet ${m}, net als bij Standaard`];
@@ -973,30 +988,42 @@ function qualityNote(service) {
       : `de stylist blijft op ${m}`);
     return `Zuinig: ${parts.join("; ")}.`;
   }
-  const standard = upgrades ? `Standaard: ${m} herkent foto's en leest bestellingen. De stylist kiest zelf: ${m} voor gewone vragen,
-      ${h(S.ai.complex_model)} voor een dresscode of een look om na te maken, en ${h(S.ai.review_model)} als een antwoord niet door de controle raakt.`
+  const standard = upgrades ? `Standaard: ${m} herkent foto's en leest bestellingen; de stylist zet de sterkere modellen in zoals hierboven.`
     : `Standaard: alles met ${m}.`;
   const saving = [cheaperHelper && `laat ${reading} over aan het goedkopere ${helper}`,
     upgrades && `houdt de stylist altijd op ${m}`].filter(Boolean);
   return saving.length ? `${standard} Zuinig ${saving.join(" en ")}.` : `${standard} Zuinig maakt bij dit model geen verschil.`;
 }
 
+/** An amount with what is known of it: ≈ all of it priced, ≥ a part couldn't be priced, ? nothing could. */
+const costText = (a) => {
+  if (a.status === "unknown" && !a.cost_eur) return "?";
+  const amount = euros(a.cost_eur);  // "< € 0,001" for a tiny amount: already says what it is
+  return amount.startsWith("<") && a.status === "estimated" ? amount : `${a.status === "estimated" ? "≈" : "≥"} ${amount}`;
+};
+const costSentence = (what, a) => a.status === "unknown" && !a.cost_eur ? `Wat ${what.toLowerCase()} kostte, is niet bekend.`
+  : `${what} kostte ${a.status === "estimated" ? "ongeveer" : "minstens"} ${euros(a.cost_eur)}.`;
+
+/** What the AI cost this year: an estimate from the tokens each answer reports, times the list price; per model id
+ * (each API call counted once, for the model that answered it) and per analysis. */
 function costsSection() {
   const u = S.ai_usage;
   if (!u?.count) return "";
   const when = (at) => new Date(at).toLocaleString("nl-BE", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  const status = u.status || (u.partial ? "partial" : "estimated");
   return `<h2 class="section-title">AI-kosten in ${u.year}</h2>
     <div class="card">
-      <div class="row"><span class="grow">${plural(u.count, "analyse", "analyses")}</span><span class="v">${u.partial ? "≥ " : "≈ "}${euros(u.cost_eur)}</span></div>
-      ${u.per_model.map((m) => `<div class="row"><span class="grow muted">${h(m.models)}<span class="small" style="display:block">${plural(m.count, "analyse", "analyses")}</span></span>
-        <span class="v">${euros(m.cost_eur)}</span></div>`).join("")}
+      <div class="row"><span class="grow">${plural(u.count, "analyse", "analyses")}</span><span class="v">${costText({ ...u, status })}</span></div>
+      ${u.per_model.map((m) => `<div class="row"><span class="grow muted">${h(m.model)}<span class="small" style="display:block">${plural(m.analyses, "analyse", "analyses")} · ${plural(m.calls, "oproep", "oproepen")}</span></span>
+        <span class="v">${costText(m)}</span></div>`).join("")}
     </div>
     <h2 class="section-title">Laatste analyses</h2>
     <div class="card">${u.latest.map((a) => `<div class="row"><span class="grow">${h(TASKS[a.task] || a.task)}${a.failed ? " (mislukt)" : ""}
-        <span class="muted small" style="display:block">${h(when(a.at))} · ${h(a.models)} · ${(a.input_tokens + a.output_tokens).toLocaleString("nl-BE")} tokens</span></span>
-        <span class="v">${a.status === "unknown" ? "?" : euros(a.cost_eur)}</span></div>`).join("")}</div>
-    <p class="footnote">Een schatting: de tokens die elk antwoord meldt, maal de prijslijst. Wat je echt betaalt, staat op ${h(aiService().console || "console.anthropic.com")}.
-      Een bedrag met ≥ mist een deel dat niet geprijsd kon worden.</p>`;
+        <span class="muted small" style="display:block">${h(when(a.at))} · ${(a.per_model || []).map((m) => `${h(m.model)} ${costText(m)}`).join(" + ") || h(a.models)} · ${(a.input_tokens + a.output_tokens).toLocaleString("nl-BE")} tokens</span></span>
+        <span class="v">${costText(a)}</span></div>`).join("")}</div>
+    <p class="footnote">Een schatting: de tokens die elk antwoord meldt, maal de prijslijst. Per model telt elke oproep één keer, bij het model dat ze
+      beantwoordde: samen maken ze het totaal. ≥ betekent dat een deel niet geprijsd kon worden (geen prijs, geen tokentelling of geen antwoord binnen
+      de tijd), ? dat niets bekend is. Wat je echt betaalt, staat op ${h(aiService().console || "console.anthropic.com")}.</p>`;
 }
 
 // MARK: - Notifications (Web Push), as in CellarPeaks
@@ -1183,6 +1210,17 @@ async function mutate(fn) {
 
 // MARK: - Actions
 
+/** The models in the picker; at ChatGPT the tested ones apart from the others. */
+function modelRows(models) {
+  const row = (m) => `<div class="row"><button class="row-button" data-act="set-model" data-value="${h(m.id)}">${h(m.name)}<span class="muted small" style="display:block">${
+    m.recommended ? `Getest op ${h(m.checked)}` : m.failed?.length ? `Niet geschikt: ${h(m.failed.join(", "))}` : m.recommended === false ? "Niet getest" : h(m.id)}</span></button>${aiService().model === m.id ? "✓" : ""}</div>`;
+  if (!models.some((m) => "recommended" in m)) return models.map(row).join("");
+  const tested = models.filter((m) => m.recommended), other = models.filter((m) => !m.recommended);
+  const head = (text) => `<div class="row"><span class="grow muted small">${text}</span></div>`;
+  return (tested.length ? head("Aanbevolen") + tested.map(row).join("") : head("Nog geen model getest"))
+    + (other.length ? head("Andere modellen") + other.map(row).join("") : "");
+}
+
 const actions = {
   tab: (el) => { ui.tab = el.dataset.tab; stack = []; render(); scrollTo(0, 0); if (ui.tab === "stylist" && S.place && !ui.weather) loadWeather(); },
   open: (el) => push({ kind: "detail", id: el.dataset.id }),
@@ -1330,8 +1368,15 @@ const actions = {
     try { models = await api(`/api/settings/models?provider=${aiProvider()}`); } catch (e) { return toast(e.message); }
     openSheet(`<div class="topbar"><span class="spacer"></span><span class="title" id="sheet-title">Model</span><button class="btn-pill strong" data-act="close-sheet">Klaar</button></div>
       <div class="card"><div class="row"><button class="row-button" data-act="set-model" data-value="">Standaard (${h(aiService().default_model)})</button></div>
-      ${models.map((m) => `<div class="row"><button class="row-button" data-act="set-model" data-value="${h(m.id)}">${h(m.name)}<span class="muted small" style="display:block">${h(m.id)}</span></button>${aiService().model === m.id ? "✓" : ""}</div>`).join("")}</div>
-      <p class="footnote">${aiProvider() === "openai" ? "Kies een model dat foto's kan lezen." : "Enkel modellen die foto's kunnen lezen."} Een groter model kiest wat fijner, maar kost meer.</p>`);
+      ${modelRows(models)}</div>
+      <p class="footnote">${aiProvider() === "openai" ? `Aanbevolen zijn enkel modellen die een live controle doorstonden: een foto lezen, een functie aanroepen,
+        een reasoning-instelling aannemen en prompt caching melden. Een niet getest model kan werken, maar dat is niet nagegaan.`
+        : "Enkel modellen die foto's kunnen lezen."} Een groter model kiest wat fijner, maar kost meer.</p>`);
+  },
+  async "set-routing"(el) {
+    if (el.dataset.value === (S.ai?.routing || "auto")) return;
+    if (await mutate(() => api("/api/settings/routing", { method: "PUT", json: { routing: el.dataset.value } })))
+      toast(el.dataset.value === "fixed" ? "Vast model: de stylist blijft op één model" : "Automatisch: de stylist mag sterkere modellen inzetten");
   },
   async "set-provider"(el) {
     if (el.dataset.value === aiProvider()) return;

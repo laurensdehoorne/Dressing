@@ -364,7 +364,8 @@ def _ai_info(user: dict) -> dict:
                 for name, spec in keys.PROVIDERS.items()}
     return {"provider": keys.provider(user), "services": services, "quality": claude.quality(user),
             "can_draw": keys.active_key(user, "openai")[0] is not None, "image_model": gpt.IMAGE_MODEL,
-            "complex_model": gpt.COMPLEX_MODEL, "review_model": gpt.REVIEW_MODEL}
+            "complex_model": gpt.COMPLEX_MODEL, "review_model": gpt.REVIEW_MODEL,
+            "routing": gpt.routing(user), "routes": gpt.routes(user)}
 
 
 @app.get("/api/state")
@@ -463,6 +464,19 @@ def set_model(body: ModelIn, user: User):
         raise HTTPException(400, "Onbekend model.")
     auth.put_user_setting(user, keys.PROVIDERS[provider]["model_setting"], chosen or None)
     return {"model": _service(provider).model(user)}
+
+
+class RoutingIn(BaseModel):
+    routing: str
+
+
+@app.put("/api/settings/routing")
+def set_routing(body: RoutingIn, user: User):
+    """ChatGPT on Luna: may the stylist call in Sol and Astra by itself ("auto"), or does Luna do it all ("fixed")."""
+    if body.routing not in gpt.ROUTING:
+        raise HTTPException(400, "Kies automatisch of vast model.")
+    auth.put_user_setting(user, "openai_routing", body.routing)
+    return _ai_info(user)
 
 
 class ProfileIn(BaseModel):

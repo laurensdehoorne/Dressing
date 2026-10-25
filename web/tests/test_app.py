@@ -452,7 +452,7 @@ def test_stylist_answer_is_metered_and_shown_in_settings(client, monkeypatch):
     assert r["analysis"]["status"] == "estimated" and r["analysis"]["cost_eur"] > 0
     usage = client.get("/api/state").json()["ai_usage"]
     assert usage["count"] == 1 and usage["latest"][0]["task"] == "stylist"
-    assert usage["per_model"][0]["models"] == claude.DEFAULT_MODEL
+    assert usage["per_model"][0]["model"] == claude.DEFAULT_MODEL
 
 
 def test_zuinig_reads_a_photo_with_the_helper_model(client, monkeypatch):
