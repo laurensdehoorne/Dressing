@@ -939,11 +939,7 @@ function renderSettings() {
     </div>
     <div class="pills" role="group" aria-label="Analyse" style="margin:14px 0 0">
       ${[["standaard", "Standaard"], ["zuinig", "Zuinig"]].map(([q, label]) => `<button data-act="set-quality" data-value="${q}" aria-pressed="${(S.ai?.quality || "standaard") === q}">${label}</button>`).join("")}</div>
-    <p class="footnote">${S.ai?.quality === "zuinig" ? `Zuinig: een foto herkennen en een bestelling lezen doet het goedkope ${h(service.helper_model)}; de stylist blijft op ${h(service.model)}.`
-      : `Standaard: alles met ${h(service.model)}. Zuinig laat een foto herkennen en een bestelling lezen over aan het goedkopere ${h(service.helper_model)}.`}</p>
-    ${aiProvider() === "openai" && S.ai?.quality !== "zuinig" && service.model === service.default_model ? `<p class="footnote">Bij ChatGPT kiest de stylist zelf:
-      ${h(service.model)} voor gewone vragen, ${h(S.ai.complex_model)} voor een dresscode of een look om na te maken, en ${h(S.ai.review_model)}
-      als een antwoord niet door de controle raakt. Kies je zelf een model of Zuinig, dan doet dat model alles.</p>` : ""}
+    <p class="footnote">${qualityNote(service)}</p>
     <p class="footnote">Maak een sleutel op ${h(service.console || "console.anthropic.com")}. Je kan voor beide diensten een sleutel bewaren
       en wisselen wanneer je wil; de herkenning en de stylist gebruiken de gekozen dienst. Een sleutel wordt versleuteld met je wachtwoord bewaard: niemand anders kan hem lezen.
       Een foto herkennen of een outfit vragen kost meestal minder dan een cent.</p>
@@ -963,6 +959,28 @@ function renderSettings() {
 const TASKS = { herkennen: "Foto herkennen", bestelling: "Bestelling lezen", stylist: "Stylist", inspiratie: "Inspiratie" };
 
 /** What the AI cost this year: an estimate from the tokens each answer reports, times the list price. */
+// What Standaard and Zuinig really do for this service. Recognising a photo and reading an order or inspiration only
+// gets cheaper when the helper model differs from the account's; at ChatGPT, Zuinig also keeps the stylist from
+// calling in its stronger models for a dress code or a second try.
+function qualityNote(service) {
+  const thrifty = S.ai?.quality === "zuinig", m = h(service.model), helper = h(service.helper_model);
+  const cheaperHelper = service.helper_model !== service.model;
+  const upgrades = aiProvider() === "openai" && service.model === service.default_model;
+  const reading = "een foto herkennen en een bestelling of inspiratie lezen";
+  if (thrifty) {
+    const parts = [cheaperHelper ? `${reading} doet het goedkopere ${helper}` : `${reading} doet ${m}, net als bij Standaard`];
+    parts.push(upgrades ? `de stylist blijft altijd op ${m}, ook voor een dresscode, een look om na te maken of een tweede poging`
+      : `de stylist blijft op ${m}`);
+    return `Zuinig: ${parts.join("; ")}.`;
+  }
+  const standard = upgrades ? `Standaard: ${m} herkent foto's en leest bestellingen. De stylist kiest zelf: ${m} voor gewone vragen,
+      ${h(S.ai.complex_model)} voor een dresscode of een look om na te maken, en ${h(S.ai.review_model)} als een antwoord niet door de controle raakt.`
+    : `Standaard: alles met ${m}.`;
+  const saving = [cheaperHelper && `laat ${reading} over aan het goedkopere ${helper}`,
+    upgrades && `houdt de stylist altijd op ${m}`].filter(Boolean);
+  return saving.length ? `${standard} Zuinig ${saving.join(" en ")}.` : `${standard} Zuinig maakt bij dit model geen verschil.`;
+}
+
 function costsSection() {
   const u = S.ai_usage;
   if (!u?.count) return "";
