@@ -5,6 +5,7 @@ import asyncio
 import base64
 import contextvars
 import os
+from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 from datetime import date, timedelta
 
@@ -412,6 +413,66 @@ _TOPS = {"top", "trui", "blazer", "sport"}
 _ONE_OF = {"broek": "broeken", "rok": "rokken", "kleed": "kleedjes", "jas": "jassen", "schoenen": "paar schoenen"}
 
 
+def _wear_history_context(worn: list[dict], names: dict[str, str], recent_limit: int = 8) -> str:
+    """Compress the full wear history into all-time counts/patterns plus a small recent detail window."""
+    if not worn:
+        return ""
+    item_wears: Counter[str] = Counter()
+    item_scores: dict[str, list[int]] = defaultdict(list)
+    pairs: Counter[tuple[str, str]] = Counter()
+    rated_contexts: dict[str, Counter[str]] = {"seizoen": Counter(), "gelegenheid": Counter()}
+    temperatures: dict[str, list[float]] = defaultdict(list)
+    for log in worn:
+        snapshots = {x.get("id"): x for x in log.get("item_snapshots", []) if isinstance(x, dict)}
+        ids = list(dict.fromkeys(log.get("item_ids", [])))
+        labels = []
+        for item_id in ids:
+            label = names.get(item_id) or snapshots.get(item_id, {}).get("name") or snapshots.get(item_id, {}).get("kind") or "verwijderd kledingstuk"
+            labels.append(label)
+            item_wears[label] += 1
+            if log.get("rating"):
+                item_scores[label].append(log["rating"])
+        if len(labels) > 1:
+            pairs.update(tuple(sorted(pair)) for n, a in enumerate(labels) for pair in ((a, b) for b in labels[n + 1:]))
+        if log.get("rating") and log["rating"] >= 4:
+            if log.get("season"):
+                rated_contexts["seizoen"][log["season"]] += 1
+            if log.get("occasion"):
+                rated_contexts["gelegenheid"][log["occasion"]] += 1
+            if isinstance(log.get("temperature"), (int, float)):
+                temperatures["hoog beoordeeld"].append(log["temperature"])
+    lines = [f"Alle {len(worn)} gedragen outfits zijn verwerkt (frequenties en patronen over de volledige geschiedenis).",
+             "Gedragen stukken (aantal; gemiddelde score waar beschikbaar): " + "; ".join(
+                 f"{name} {count}×" + (f", score {sum(item_scores[name]) / len(item_scores[name]):.1f}/5" if item_scores[name] else "")
+                 for name, count in item_wears.most_common()),]
+    if pairs:
+        lines.append("Vaak samen gedragen: " + "; ".join(f"{a} + {b} ({count}×)" for (a, b), count in pairs.most_common(12)))
+    for label, values in rated_contexts.items():
+        if values:
+            lines.append(f"Goed beoordeeld per {label}: " + ", ".join(f"{name} ({count}×)" for name, count in values.most_common(8)))
+    if temperatures["hoog beoordeeld"]:
+        temps = temperatures["hoog beoordeeld"]
+        lines.append(f"Goed beoordeeld bij {min(temps):g}–{max(temps):g} °C")
+    recent = []
+    for log in sorted(worn, key=lambda row: row.get("date", ""), reverse=True)[:recent_limit]:
+        snapshots = {x.get("id"): x for x in log.get("item_snapshots", []) if isinstance(x, dict)}
+        pieces = [names.get(i) or snapshots.get(i, {}).get("name") or snapshots.get(i, {}).get("kind") or "verwijderd kledingstuk"
+                  for i in log.get("item_ids", [])]
+        context = [log.get("season")] if log.get("season") else []
+        if log.get("temperature") is not None:
+            context.append(f"{log['temperature']}°C")
+        detail = f"{log.get('date', '')[:10]} ({', '.join(context)}): " + " + ".join(pieces)
+        if log.get("occasion"):
+            detail += f" ({log['occasion']})"
+        if log.get("rating"):
+            detail += f", score {log['rating']}/5"
+        if log.get("note"):
+            detail += f", '{_short(log['note'], 120)}'"
+        recent.append(detail)
+    lines.append(f"Laatste {len(recent)} outfits in detail:\n" + "\n".join(recent))
+    return "\n".join(lines)
+
+
 async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[dict], *, weather: str = "",
                           profile: str = "", style: str = "", packed: list[str] | None = None,
                           weather_at: Callable[[dict], Awaitable[str]] | None = None, trip: bool = False, rejected: list[dict] = (),
@@ -437,20 +498,6 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         if not available:
             raise ClaudeError("Er hangt nog niets in je dressing (of alles is in de was). Voeg eerst kledingstukken toe.")
     names = {i["id"]: i.get("name") or i.get("kind") or "" for i in items}
-    # Keep the complete worn history in the stylist context so it can learn from every outfit.
-    taste = []
-    for log in sorted(worn, key=lambda l: l["date"], reverse=True):
-        context = [log.get("season")] if log.get("season") else []
-        if log.get("temperature") is not None:
-            context.append(f"{log['temperature']}°C")
-        line = f"{log['date'][:10]} ({', '.join(context)}): " + " + ".join(names.get(i, "?") for i in log.get("item_ids", []))
-        if log.get("occasion"):
-            line += f" ({log['occasion']})"
-        if log.get("rating"):
-            line += f", score {log['rating']}/5"
-        if log.get("note"):
-            line += f", '{log['note'][:120]}'"
-        taste.append(line)
     refused_count: dict[str, int] = {}
     for r in rejected:
         for item_id in r.get("item_ids", []):
@@ -461,8 +508,8 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         wardrobe = f"Mijn stijl, uit outfits die ik mooi vind:\n{style}\n\n{wardrobe}"
     if profile:
         wardrobe = f"Over mij: {profile}\n\n{wardrobe}"
-    if taste:
-        wardrobe += "\n\nWat ik eerder droeg en hoe het viel:\n" + "\n".join(taste)
+    if history := _wear_history_context(worn, names):
+        wardrobe += "\n\nMijn gedragen outfitgeschiedenis, lokaal samengevat:\n" + history
     if learned:
         wardrobe += "\n\nMijn voorkeuren, lokaal geleerd uit mijn gedragen outfits en afwijzingen (samenvatting):\n" + learned
     if refused := [_rejected_line(r, names) for r in rejected[:REJECTED_SHOWN]]:

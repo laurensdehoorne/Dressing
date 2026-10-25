@@ -915,13 +915,15 @@ def test_stylist_sees_what_a_piece_is_for_and_what_was_worn_lately(client, monke
     assert "voor kantoor, etentje" in line and "Strak hemd, mooi onder een blazer." in line and "notitie 'Knelt wat aan de kraag'" in line
     assert "2× in een afgewezen outfit" in line
     assert "1× in een afgewezen outfit" in next(l for l in seen["text"].splitlines() if l.startswith(jeans["id"]))
-    worn = seen["text"].split("Wat ik eerder droeg en hoe het viel:\n")[1].split("\n\n")[0].splitlines()
-    assert [w[:10] for w in worn] == [lately, long_ago, long_ago]  # every prior outfit, including old unrated outfits
-    assert "°C" in worn[0] and "herfst" in worn[0] and "(kantoor)" in worn[0]
+    worn = seen["text"].split("Mijn gedragen outfitgeschiedenis, lokaal samengevat:\n")[1].split("\n\n")[0]
+    assert "Alle 3 gedragen outfits zijn verwerkt" in worn
+    assert "Jeans 3×" in worn  # old, unrated outfits also contribute to all-time counts
+    assert lately in worn and long_ago in worn
+    assert "°C" in worn and "herfst" in worn and "(kantoor)" in worn
     assert claude._short("een twee drie vier", 9) == "een twee…"
 
 
-def test_stylist_includes_every_worn_outfit_past_the_old_history_limit(client, monkeypatch):
+def test_stylist_compacts_full_worn_history_and_keeps_recent_details(client, monkeypatch):
     item = add(client, name="Blauwe trui")
     from datetime import date, timedelta
     first_day = date.today() - timedelta(days=200)
@@ -937,9 +939,11 @@ def test_stylist_includes_every_worn_outfit_past_the_old_history_limit(client, m
     monkeypatch.setattr(claude, "_ask", fake_ask)
     result = client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
     assert result.status_code == 200, result.text
-    history = seen["text"].split("Wat ik eerder droeg en hoe het viel:\n")[1].split("\n\n")[0].splitlines()
-    assert len(history) == 30
-    assert history[-1].startswith(first_day.isoformat())
+    history = seen["text"].split("Mijn gedragen outfitgeschiedenis, lokaal samengevat:\n")[1].split("\n\n")[0]
+    assert "Alle 30 gedragen outfits zijn verwerkt" in history
+    assert "Blauwe trui 30×" in history
+    assert "Laatste 8 outfits in detail:" in history
+    assert first_day.isoformat() not in history  # old dates live in the aggregate, not the prompt
 
 
 def test_stylist_receives_cached_trends_with_its_existing_ai_request(client, monkeypatch):
