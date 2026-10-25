@@ -28,7 +28,7 @@ const REFINE_SUGGESTIONS = [["👟", "Andere schoenen"], ["👔", "Iets chiquer"
 const TRIP_SUGGESTIONS = [["Op reis", [["🧳", "Wat neem ik mee? Help me inpakken"], ["🗺️", "Een dag op stap in de stad"], ["🍽️", "Etentje 's avonds"],
   ["🥾", "Een wandeldag"], ["🏖️", "Een dag aan het water"], ["✈️", "De reisdag zelf"]]]];
 
-let S = { items: [], worn: [], categories: [], statuses: [] };
+let S = { items: [], worn: [], liked_outfits: [], categories: [], statuses: [] };
 const ui = {
   tab: "dressing",
   category: "", search: "", sort: "added", place: "",
@@ -128,7 +128,7 @@ async function smaller(file, side = 1600) {
 
 function signedOut() {
   ui.auth = { setup_needed: false, user: null };
-  S = { items: [], worn: [], categories: [], statuses: [] };
+  S = { items: [], worn: [], liked_outfits: [], categories: [], statuses: [] };
   stack = [];
   ui.users = null; ui.models = null; ui.weather = undefined; ui.push = null;
   ui.stylist = { query: "", loading: false, result: null, error: null, useWeather: true, step: "", onTrip: null, thread: [], refine: "" };
@@ -648,7 +648,10 @@ function outfitsHTML(r) {
   }).join("");
   return `${elsewhere}${r.advice ? `<p class="advice">${h(r.advice)}</p>` : ""}
     ${r.trend_sources?.length ? `<p class="footnote">Actuele trendartikelen (cache van ${h(r.trend_sources[0].updated)}): ${[...new Map(r.trend_sources.map((s) => [s.source, s])).values()].map((s) => `<a href="${h(s.url)}" target="_blank" rel="noopener noreferrer">${h(s.source)}</a>`).join(" · ")}</p>` : ""}
-    ${r.outfits.map((o, n) => `<article class="card outfit${o.rejected ? " rejected" : ""}">
+    ${r.outfits.map((o, n) => {
+      const query = ui.stylist.thread.join(" → ") || ui.stylist.query;
+      const saved = (S.liked_outfits || []).find((x) => x.item_ids?.length === o.item_ids?.length && x.item_ids.every((id, i) => id === o.item_ids[i]));
+      return `<article class="card outfit${o.rejected ? " rejected" : ""}">
       <div class="head"><span class="n">Outfit ${n + 1}</span><h2>${h(o.title)}</h2></div>
       <div class="pieces">${o.item_ids.map(piece).join("")}</div>
       <p class="why">${h(o.reason)}</p>${o.tip ? `<p class="tip">💡 ${h(o.tip)}</p>` : ""}
@@ -656,7 +659,9 @@ function outfitsHTML(r) {
       ${o.rejected ? `<div class="notice turned-down"><span class="grow">👎 Afgekeurd: ${h(rejectWhy(o.rejected))}</span><button data-act="undo-reject" data-n="${n}">Ongedaan maken</button></div>`
         : `<div class="foot"><button class="btn-secondary narrow" data-act="reject-outfit" data-n="${n}" aria-label="Niet goed">👎</button>
         ${r.trip && o.item_ids.some((id) => !packed(id)) ? `<button class="btn-secondary" data-act="pack-outfit" data-n="${n}">🧳 In de valies</button>` : ""}
-        <button class="btn-primary" data-act="wear-outfit" data-n="${n}">Dit draag ik</button></div>`}</article>`).join("")}
+        <button class="btn-secondary" data-act="like-outfit" data-n="${n}" data-id="${h(saved?.id || "")}">${saved ? "★ Bewaard" : "♡ Mooi"}</button>
+        <button class="btn-primary" data-act="wear-outfit" data-n="${n}">Dit draag ik</button></div>`}</article>`;
+    }).join("")}
     ${!r.outfits.length ? `<div class="notice">Geen outfit gevonden die past.</div>` : ""}
     ${r.missing ? `<div class="notice">🛍️ ${h(r.missing)}</div>` : ""}
     ${r.analysis ? `<p class="footnote" style="text-align:center">${costSentence("Dit antwoord", r.analysis)}</p>` : ""}`;
@@ -734,6 +739,16 @@ function openRejectedList() {
         <button class="btn-plain small" data-act="forget-reject" data-id="${h(r.id)}">Vergeet</button></div>`).join("")}</div>`
       : `<div class="card pad muted">Nog niets afgekeurd. Tik 👎 bij een voorgesteld outfit dat niet goed is.</div>`}
     <p class="footnote">De stylist ziet de laatste 25 en stelt die outfits niet opnieuw voor. Vergeet je er een, dan mag hij het weer voorstellen.</p>`);
+}
+
+function openLikedOutfits() {
+  const list = S.liked_outfits || [];
+  openSheet(`<div class="topbar"><span class="spacer"></span><span class="title" id="sheet-title">Bewaarde voorstellen</span><button class="btn-pill strong" data-act="close-sheet">Klaar</button></div>
+    ${list.length ? `<div class="card">${list.map((o) => `<div class="row"><span class="grow" style="min-width:0">${h(o.title || "Outfit")}
+        <span class="muted small" style="display:block">${h((o.item_ids || []).map((id) => o.item_names?.[id] || itemById(id)?.name).filter(Boolean).join(" + "))} · ${h(o.query || "bewaard")}</span></span>
+        <button class="btn-plain small" data-act="forget-liked" data-id="${h(o.id)}">Vergeet</button></div>`).join("")}</div>`
+      : `<div class="card pad muted">Nog geen voorstellen bewaard. Tik ♡ Mooi bij een suggestie.</div>`}
+    <p class="footnote">Bewaarde voorstellen zijn feedback voor je kleurprofiel en volgende outfitkeuzes. Ze worden niet als gedragen outfits geteld.</p>`);
 }
 
 // MARK: - Inspiration: outfits from Instagram or Pinterest, and the style the AI writes from them
@@ -924,12 +939,21 @@ function renderSettings() {
         <textarea id="s-profile" name="profile" rows="3" placeholder="bv. man, 38, werk in een creatief bureau; hou van smart casual in aardetinten; geen skinny jeans">${h(S.profile)}</textarea></div>
       <div class="auth-submit"><button class="btn-primary">Bewaren</button></div></form>
     <p class="footnote">Gaat mee naar de stylist bij elke vraag.</p>
+    <h2 class="section-title">Kleurvoorkeuren</h2>
+    <div class="card pad"><div class="muted small">Lokaal afgeleid uit je goed beoordeelde outfits en bewaarde voorstellen</div>
+      <p style="margin-bottom:0">${h(S.learned_colors || "Nog te weinig feedback om kleurpatronen af te leiden.")}</p></div>
+    <form class="card" data-act-submit="save-color-profile"><div class="field"><label for="s-color-profile">Jouw correcties of favoriete kleuren</label>
+      <textarea id="s-color-profile" name="profile" rows="2" placeholder="bv. draag graag olijfgroen; vermijd pastelgeel">${h(S.color_profile || "")}</textarea></div>
+      <div class="auth-submit"><button class="btn-primary">Kleurvoorkeuren bewaren</button></div></form>
+    <p class="footnote">Je correcties wegen mee bij elk outfitvoorstel; de lokale samenvatting wordt automatisch opnieuw berekend als je feedback geeft.</p>
     <div class="card" style="margin-top:12px"><div class="row"><button class="row-button" data-act="inspiration">✨ Inspiratie van Instagram en Pinterest
       <span class="muted small" style="display:block">${looks().length ? `${plural(looks().length, "outfit", "outfits")} · je stijl gaat mee naar de stylist` : "Bewaar outfits die je mooi vindt"}</span></button>
       <span class="muted" aria-hidden="true">›</span></div>
       <div class="row"><button class="row-button" data-act="rejected-list">👎 Afgekeurde outfits
       <span class="muted small" style="display:block">${S.rejected?.length ? `${plural(S.rejected.length, "outfit", "outfits")} die de stylist niet meer voorstelt` : "Nog niets afgekeurd"}</span></button>
       <span class="muted" aria-hidden="true">›</span></div></div>
+    <div class="card" style="margin-top:12px"><div class="row"><button class="row-button" data-act="liked-list">♡ Bewaarde voorstellen
+      <span class="muted small" style="display:block">${plural((S.liked_outfits || []).length, "outfit", "outfits")} die je mooi vindt</span></button><span class="muted" aria-hidden="true">›</span></div></div>
     <h2 class="section-title">Weer</h2>
     <form class="card" data-act-submit="save-place">
       <div class="field"><label for="s-place">Woonplaats</label><input id="s-place" name="place" value="${h(S.place?.name || "")}" placeholder="bv. Kortrijk"></div>
@@ -1392,6 +1416,34 @@ const actions = {
     delete o.rejected; render();
   },
   "rejected-list": () => openRejectedList(),
+  "liked-list": () => openLikedOutfits(),
+  async "like-outfit"(el) {
+    const outfit = ui.stylist.result?.outfits[Number(el.dataset.n)];
+    if (!outfit) return;
+    try {
+      if (el.dataset.id) {
+        await api(`/api/liked-outfits/${el.dataset.id}`, { method: "DELETE" });
+        S.liked_outfits = (S.liked_outfits || []).filter((x) => x.id !== el.dataset.id);
+        toast("Bewaard voorstel verwijderd");
+      } else {
+        const saved = await api("/api/liked-outfits", { method: "POST", json: {
+          item_ids: outfit.item_ids, query: ui.stylist.thread.join(" → ") || ui.stylist.query,
+          title: outfit.title, request_id: requestId(),
+        } });
+        S.liked_outfits = [saved, ...(S.liked_outfits || []).filter((x) => x.id !== saved.id)];
+        toast("Onthouden: dit voorstel vind je mooi");
+      }
+      render();
+    } catch (e) { toast(e.message); }
+  },
+  async "forget-liked"(el) {
+    try {
+      await api(`/api/liked-outfits/${el.dataset.id}`, { method: "DELETE" });
+      S.liked_outfits = (S.liked_outfits || []).filter((x) => x.id !== el.dataset.id);
+      openLikedOutfits();
+      toast("Vergeten");
+    } catch (e) { toast(e.message); }
+  },
   async "forget-reject"(el) {
     try { await api(`/api/rejected/${el.dataset.id}`, { method: "DELETE" }); } catch (e) { return toast(e.message); }
     S.rejected = (S.rejected || []).filter((r) => r.id !== el.dataset.id);
@@ -1548,6 +1600,7 @@ const submits = {
     if (await mutate(() => api("/api/settings/style-profile", { method: "PUT", json: { profile: form.profile.value } }))) { page.editing = false; render(); toast("Bewaard"); }
   },
   async "save-profile"(form) { if (await mutate(() => api("/api/settings/profile", { method: "PUT", json: { profile: form.profile.value } }))) toast("Bewaard"); },
+  async "save-color-profile"(form) { if (await mutate(() => api("/api/settings/color-profile", { method: "PUT", json: { profile: form.profile.value } }))) toast("Kleurvoorkeuren bewaard"); },
   async "save-place"(form) {
     const r = await mutate(() => api("/api/settings/place", { method: "PUT", json: { place: form.place.value } }));
     if (r) { toast(r.place ? `Weer van ${r.place.name}` : "Woonplaats gewist"); ui.weather = undefined; if (r.place) loadWeather(); }

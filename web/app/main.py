@@ -321,7 +321,7 @@ def delete_user(user_id: str, admin: Admin, request: Request):
             raise HTTPException(404, "Account niet gevonden.")
         items = [r["id"] for r in conn.execute("SELECT id FROM items WHERE user_id = ?", (user_id,))]
         items += [r["id"] for r in conn.execute("SELECT id FROM inspiration WHERE user_id = ?", (user_id,))]
-        for table in ("worn", "rejected", "items", "inspiration", "sessions", "ai_usage", "request_keys", "push_subscriptions"):
+        for table in ("worn", "rejected", "liked_outfits", "items", "inspiration", "sessions", "ai_usage", "request_keys", "push_subscriptions"):
             conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         audit.record(request, "account_deleted", row["username"], None, conn)
@@ -386,12 +386,17 @@ def _ai_info(user: dict) -> dict:
 def state(user: User):
     settings = auth.user_settings(user)
     with db.connect() as conn:
+        items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ? ORDER BY date_added DESC", (user["id"],))]
+        worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user["id"],))]
+        rejected = [db.rejected_row(r) for r in _rejected(conn, user)]
+        liked = [db.liked_outfit_row(r) for r in conn.execute("SELECT * FROM liked_outfits WHERE user_id = ? ORDER BY at DESC", (user["id"],))]
         return {
             "user": user,
-            "items": [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ? ORDER BY date_added DESC", (user["id"],))],
-            "worn": [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user["id"],))],
+            "items": items,
+            "worn": worn,
             "inspiration": [db.inspiration_row(r) for r in _inspiration(conn, user, newest_first=True)],
-            "rejected": [db.rejected_row(r) for r in _rejected(conn, user)],
+            "rejected": rejected,
+            "liked_outfits": liked,
             "categories": [{"key": k, "label": v} for k, v in db.CATEGORIES.items()],
             "statuses": [{"key": k, "label": v} for k, v in db.STATUSES.items()],
             "seasons": db.SEASONS, "formality": db.FORMALITY, "warmth": db.WARMTH, "reject_reasons": REJECT_REASONS,
@@ -401,6 +406,8 @@ def state(user: User):
             "trip": settings.get("trip"),
             "profile": settings.get("profile") or "",
             "style_profile": settings.get("style_profile") or "",
+            "color_profile": settings.get("color_profile") or "",
+            "learned_colors": _learned_color_profile(items, worn, rejected, liked),
             "background_ai": {"enabled": settings.get("background_ai_enabled", True),
                               "interval_days": settings.get("background_ai_interval_days", 30)},
             "version": VERSION,
@@ -505,6 +512,12 @@ def set_profile(body: ProfileIn, user: User):
     return {"ok": True}
 
 
+@app.put("/api/settings/color-profile")
+def set_color_profile(body: ProfileIn, user: User):
+    auth.put_user_setting(user, "color_profile", body.profile.strip()[:1000] or None)
+    return {"color_profile": auth.user_settings(user).get("color_profile") or ""}
+
+
 @app.post("/api/settings/refresh-learning")
 async def refresh_learning_and_trends(user: AIUser, request: Request):
     return await _background(request, user, _refresh_learning_and_trends(user))
@@ -515,9 +528,10 @@ async def _refresh_learning_and_trends(user: dict) -> dict:
     with db.connect() as conn:
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user["id"],))]
         rejected = [db.rejected_row(r) for r in _rejected(conn, user)]
+        liked = [db.liked_outfit_row(r) for r in conn.execute("SELECT * FROM liked_outfits WHERE user_id = ? ORDER BY at DESC", (user["id"],))]
     _refresh_outfit_learning(user["id"], changed=False)
     settings = auth.user_settings(user)
-    has_history = bool(worn or rejected)
+    has_history = bool(worn or rejected or liked)
 
     async def summarize() -> bool:
         if not has_history:
@@ -527,7 +541,7 @@ async def _refresh_learning_and_trends(user: dict) -> dict:
         auth.put_user_setting(user, "learning_ai_attempted_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
         local_profile = settings.get("learned_profile") or ""
         result = await _analysis(user, "voorkeurssamenvatting", claude.learn_style(
-            user, _learning_input(worn, rejected, local_profile)))
+            user, _learning_input(worn, rejected, local_profile, liked)))
         summary = result.get("samenvatting", "") if isinstance(result, dict) else ""
         auth.put_user_setting(user, "learned_profile_ai", summary or None)
         auth.put_user_setting(user, "learning_dirty", False)
@@ -676,9 +690,9 @@ async def set_item_photo(item_id: str, user: User, photo: UploadFile = File(...)
 
 # MARK: - Worn (outfits that were worn)
 
-def _learned_outfit_profile(worn: list[dict], rejected: list[dict]) -> str:
+def _learned_outfit_profile(worn: list[dict], rejected: list[dict], liked: list[dict] = ()) -> str:
     """Cheap local preference learning; capped and deterministic, with no model/API call."""
-    if not worn and not rejected:
+    if not worn and not rejected and not liked:
         return ""
     from collections import Counter
     good_items, poor_items, good_seasons, good_occasions, reject_reasons = Counter(), Counter(), Counter(), Counter(), Counter()
@@ -697,9 +711,14 @@ def _learned_outfit_profile(worn: list[dict], rejected: list[dict]) -> str:
             poor_items.update(names)
     for log in rejected:
         reject_reasons.update(r for r in log.get("reasons", []) if r)
+    for outfit in liked:
+        for item_id in outfit.get("item_ids", []):
+            name = outfit.get("item_names", {}).get(item_id)
+            if name:
+                good_items[name] += 1
     parts = [f"{len(worn)} gelogde outfits"] if worn else []
     if good_items:
-        parts.append("goed beoordeeld: " + ", ".join(f"{n} ({c}×)" for n, c in good_items.most_common(4)))
+        parts.append("goed beoordeeld of bewaard: " + ", ".join(f"{n} ({c}×)" for n, c in good_items.most_common(4)))
     if poor_items:
         parts.append("laag beoordeeld: " + ", ".join(f"{n} ({c}×)" for n, c in poor_items.most_common(3)))
     if good_seasons:
@@ -714,12 +733,43 @@ def _learned_outfit_profile(worn: list[dict], rejected: list[dict]) -> str:
     return "; ".join(parts)[:700]
 
 
+def _learned_color_profile(items: list[dict], worn: list[dict], rejected: list[dict], liked: list[dict] = ()) -> str:
+    """Summarize clothing colours associated with high and low feedback, without an AI call."""
+    from collections import Counter
+    colors_by_id = {item["id"]: [str(c).strip().lower() for c in (item.get("colors") or []) if str(c).strip()] for item in items}
+    def colors_for(outfit: dict) -> list[str]:
+        snapshots = {x.get("id"): x for x in outfit.get("item_snapshots", []) if isinstance(x, dict)}
+        colors = outfit.get("item_colors", {})
+        return [str(color).strip().lower() for item_id in outfit.get("item_ids", [])
+                for color in (colors.get(item_id) or snapshots.get(item_id, {}).get("colors") or colors_by_id.get(item_id, [])) if str(color).strip()]
+    liked_colors, disliked_colors = Counter(), Counter()
+    for outfit in worn:
+        colors = colors_for(outfit)
+        rating = outfit.get("rating")
+        if rating and rating >= 4:
+            liked_colors.update(colors)
+        elif rating and rating <= 2:
+            disliked_colors.update(colors)
+    for outfit in liked:
+        liked_colors.update(colors_for(outfit))
+    for outfit in rejected:
+        if "Kleuren botsen" in outfit.get("reasons", []):
+            disliked_colors.update(colors_for(outfit))
+    parts = []
+    if liked_colors:
+        parts.append("kleuren in goed beoordeelde of bewaarde outfits: " + ", ".join(f"{c} ({n}×)" for c, n in liked_colors.most_common(6)))
+    if disliked_colors:
+        parts.append("kleuren in laag beoordeelde of afgewezen outfits: " + ", ".join(f"{c} ({n}×)" for c, n in disliked_colors.most_common(6)))
+    return "; ".join(parts)
+
+
 def _refresh_outfit_learning(user_id: str, *, changed: bool = True) -> None:
     with db.connect() as conn:
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user_id,))]
         rejected = [db.rejected_row(r) for r in _rejected(conn, {"id": user_id})]
+        liked = [db.liked_outfit_row(r) for r in conn.execute("SELECT * FROM liked_outfits WHERE user_id = ? ORDER BY at DESC", (user_id,))]
     settings = auth.user_settings({"id": user_id})
-    profile = _learned_outfit_profile(worn, rejected) or None
+    profile = _learned_outfit_profile(worn, rejected, liked) or None
     if profile != settings.get("learned_profile"):
         auth.put_user_setting({"id": user_id}, "learned_profile", profile)
         changed = True  # existing history needs its first AI interpretation too
@@ -751,7 +801,7 @@ def _learning_due(settings: dict, now: datetime | None = None) -> bool:
     return attempted is None or now - attempted.astimezone(timezone.utc) >= timedelta(days=days)
 
 
-def _learning_input(worn: list[dict], rejected: list[dict], local_profile: str) -> str:
+def _learning_input(worn: list[dict], rejected: list[dict], local_profile: str, liked: list[dict] = ()) -> str:
     lines = [f"Lokale samenvatting van alle feedback: {local_profile}", "Recente gedragen outfits:"]
     for log in worn[:35]:
         names = {x.get("id"): x.get("name") or x.get("kind") or "kledingstuk" for x in log.get("item_snapshots", [])}
@@ -766,19 +816,24 @@ def _learning_input(worn: list[dict], rejected: list[dict], local_profile: str) 
     if rejected:
         lines.append("Feedback op afgewezen voorstellen:")
         lines.extend(f"- {', '.join(r.get('reasons', []))}: {r.get('note', '')[:80]}" for r in rejected[:20])
+    if liked:
+        lines.append("Outfits die expliciet mooi gevonden of bewaard zijn (niet noodzakelijk gedragen):")
+        lines.extend(f"- {o.get('title', 'Outfit')}: {', '.join(o.get('item_names', {}).values())} · vraag: {o.get('query', '')[:80]}"
+                     for o in liked[:20])
     return "\n".join(lines)[:6000]
 
 
-def _schedule_learning(user: dict, settings: dict, worn: list[dict], rejected: list[dict], local_profile: str) -> None:
+def _schedule_learning(user: dict, settings: dict, worn: list[dict], rejected: list[dict], local_profile: str,
+                       liked: list[dict] = ()) -> None:
     """At most one helper-model interpretation per user per month, only after closet feedback changes."""
     user_id = user["id"]
-    if len(worn) < 3 and not rejected and not any(log.get("rating") for log in worn):
+    if len(worn) < 3 and not rejected and not liked and not any(log.get("rating") for log in worn):
         return  # wait for enough signal to make the extra call useful
     if not _learning_due(settings) or (_learning_tasks.get(user_id) and not _learning_tasks[user_id].done()):
         return
     revision = int(settings.get("learning_revision") or 0)
     auth.put_user_setting(user, "learning_ai_attempted_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
-    history = _learning_input(worn, rejected, local_profile)
+    history = _learning_input(worn, rejected, local_profile, liked)
 
     async def run() -> None:
         try:
@@ -926,6 +981,51 @@ def delete_rejected(rejected_id: str, user: User):
     with db.connect() as conn:
         if not conn.execute("DELETE FROM rejected WHERE id = ? AND user_id = ?", (rejected_id, user["id"])).rowcount:
             raise HTTPException(404, "Deze afkeuring bestaat niet meer.")
+    _refresh_outfit_learning(user["id"])
+    return {"ok": True}
+
+
+class LikedOutfitIn(BaseModel):
+    item_ids: list[str]
+    query: str = ""
+    title: str = ""
+    request_id: str = ""
+
+
+@app.post("/api/liked-outfits")
+def add_liked_outfit(body: LikedOutfitIn, user: User):
+    return _once(user, body.request_id, lambda: _add_liked_outfit(body, user))
+
+
+def _add_liked_outfit(body: LikedOutfitIn, user: dict) -> dict:
+    with db.connect() as conn:
+        ids = list(dict.fromkeys(i for i in body.item_ids if i in _own_item_ids(conn, user)))
+        if not ids:
+            raise HTTPException(400, "Dit outfit bestaat niet meer.")
+        rows = conn.execute("SELECT id, data FROM items WHERE user_id = ?", (user["id"],)).fetchall()
+        names = {r["id"]: (json.loads(r["data"]).get("name") or "Kledingstuk") for r in rows if r["id"] in ids}
+        query = body.query.strip()[:300]
+        # Repeated taps or a refreshed result do not create duplicate saved feedback.
+        for row in conn.execute("SELECT * FROM liked_outfits WHERE user_id = ? ORDER BY at DESC", (user["id"],)):
+            saved = db.liked_outfit_row(row)
+            if saved.get("item_ids") == ids and saved.get("query") == query:
+                return saved
+        data = {"item_ids": ids, "item_names": names, "query": query, "title": body.title.strip()[:120]}
+        liked_id = db.new_id()
+        conn.execute("INSERT INTO liked_outfits (id, user_id, at, data) VALUES (?, ?, ?, ?)",
+                     (liked_id, user["id"], db.now_iso(), json.dumps(data, ensure_ascii=False)))
+        conn.execute("DELETE FROM liked_outfits WHERE user_id = ? AND id NOT IN (SELECT id FROM liked_outfits WHERE user_id = ? ORDER BY at DESC LIMIT 200)",
+                     (user["id"], user["id"]))
+        result = db.liked_outfit_row(conn.execute("SELECT * FROM liked_outfits WHERE id = ?", (liked_id,)).fetchone())
+    _refresh_outfit_learning(user["id"])
+    return result
+
+
+@app.delete("/api/liked-outfits/{liked_id}")
+def delete_liked_outfit(liked_id: str, user: User):
+    with db.connect() as conn:
+        if not conn.execute("DELETE FROM liked_outfits WHERE id = ? AND user_id = ?", (liked_id, user["id"])).rowcount:
+            raise HTTPException(404, "Dit bewaarde outfit bestaat niet meer.")
     _refresh_outfit_learning(user["id"])
     return {"ok": True}
 
@@ -1648,11 +1748,17 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
         items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ?", (user["id"],))]
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ?", (user["id"],))]
         rejected = [db.rejected_row(r) for r in _rejected(conn, user, claude.REJECTED_SHOWN)]
+        liked = [db.liked_outfit_row(r) for r in conn.execute("SELECT * FROM liked_outfits WHERE user_id = ? ORDER BY at DESC LIMIT 30", (user["id"],))]
     local_profile = settings.get("learned_profile") or ""
-    _schedule_learning(user, settings, worn, rejected, local_profile)
+    _schedule_learning(user, settings, worn, rejected, local_profile, liked)
     learned = local_profile
     if settings.get("learned_profile_ai"):
         learned += "\nAI-interpretatie van patronen: " + settings["learned_profile_ai"]
+    learned_colors = _learned_color_profile(items, worn, rejected, liked)
+    if learned_colors:
+        learned += "\nKleurvoorkeuren lokaal afgeleid uit beoordelingen en bewaarde voorstellen: " + learned_colors
+    if settings.get("color_profile"):
+        learned += "\nKleurcorrecties van de gebruiker (volg deze expliciet): " + settings["color_profile"]
     trend_text, trend_sources = trends.context()
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
                                           style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None, trends=trend_text, learned=learned)

@@ -21,7 +21,7 @@ H = {"X-Dressing": "1"}
 def client(monkeypatch):
     db.init()
     with db.connect() as conn:
-        for table in ("worn", "rejected", "items", "inspiration", "sessions", "login_failures", "audit_log", "ai_usage", "request_keys", "push_subscriptions", "users"):
+        for table in ("worn", "rejected", "liked_outfits", "items", "inspiration", "sessions", "login_failures", "audit_log", "ai_usage", "request_keys", "push_subscriptions", "users"):
             conn.execute(f"DELETE FROM {table}")
     monkeypatch.setattr(main.keys, "active_key", lambda user, name="claude": ("sk-test", "env"))
     with TestClient(main.app) as c:
@@ -198,6 +198,39 @@ def test_manual_refresh_summarizes_history_and_forces_trend_refresh(client, monk
     assert result.json()["trends_updated"] is True
     assert "Donkerblauwe blazer" in calls["history"] and calls["force"] is True
     assert main.auth.user_settings(client.get("/api/state").json()["user"])["learned_profile_ai"] == "Draagt graag blazers op het werk."
+
+
+def test_liked_suggestion_is_separate_from_worn_and_teaches_colors(client):
+    item = add(client, name="Olijfgroene blazer", colors=["olijfgroen"])
+    payload = {"item_ids": [item["id"]], "query": "werk", "title": "Groen en verzorgd", "request_id": "like-save-0001"}
+    saved = client.post("/api/liked-outfits", json=payload, headers=H)
+    assert saved.status_code == 200, saved.text
+    assert client.post("/api/liked-outfits", json=payload, headers=H).json()["id"] == saved.json()["id"]
+    state = client.get("/api/state").json()
+    assert state["worn"] == []
+    assert len(state["liked_outfits"]) == 1
+    assert "olijfgroen" in state["learned_colors"]
+    assert "Olijfgroene blazer" in main.auth.user_settings(state["user"])["learned_profile"]
+    assert "Olijfgroene blazer" in main._learning_input([], [], "", state["liked_outfits"])
+    assert client.delete(f"/api/liked-outfits/{saved.json()['id']}", headers=H).status_code == 200
+    assert client.get("/api/state").json()["liked_outfits"] == []
+
+
+def test_color_preferences_can_be_corrected_and_are_sent_to_stylist(client, monkeypatch):
+    item = add(client, name="Blauwe trui", colors=["marineblauw"])
+    client.put("/api/settings/color-profile", json={"profile": "Vermijd felrood; marineblauw is favoriet."}, headers=H)
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
+        seen["text"] = content[0]["text"]
+        return {"advies": "", "outfits": []}
+
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    result = client.post("/api/stylist", json={"query": "casual", "use_weather": False}, headers=H)
+    assert result.status_code == 200, result.text
+    assert "Vermijd felrood; marineblauw is favoriet." in seen["text"]
+    state = client.get("/api/state").json()
+    assert state["color_profile"] == "Vermijd felrood; marineblauw is favoriet."
 
 
 def test_worn_history_keeps_item_snapshots_after_item_deletion(client):
