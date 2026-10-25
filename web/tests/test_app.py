@@ -81,6 +81,18 @@ def test_clean_item_limits_fields_and_values():
                    "colors": ["wit", "blauw"], "price": None}
 
 
+@pytest.mark.parametrize("price", ["NaN", "Infinity", "-Infinity"])
+def test_clean_item_rejects_non_finite_prices(price):
+    assert db.clean_item({"price": price})["price"] is None
+
+
+def test_jpeg_rejects_images_over_pixel_limit(monkeypatch):
+    monkeypatch.setattr(main, "MAX_IMAGE_PIXELS", 100)
+    with pytest.raises(main.HTTPException) as exc:
+        main._jpeg(jpeg(), 1200)
+    assert exc.value.status_code == 413
+
+
 def test_update_and_delete_item(client):
     item = add(client)
     r = client.patch(f"/api/items/{item['id']}", json={"status": "was", "location": "Wasmand"}, headers=H)
@@ -234,6 +246,7 @@ def test_order_photos_only_from_the_internet():
     assert not main._public_host("https://127.0.0.1/a.jpg")
     assert not main._public_host("https://192.168.1.10/a.jpg")
     assert not main._public_host("https://localhost/a.jpg")
+    assert main._public_addresses("https://192.168.1.10/a.jpg") is None
     assert main._fetch_photo("https://10.0.0.1/a.jpg") is None
 
 
@@ -585,22 +598,11 @@ def test_inspiration_from_a_pinterest_link(client, monkeypatch):
 
 def test_page_photo_comes_from_its_preview_picture(monkeypatch):
     page = b'<html><head><meta content="https://i.pinimg.com/736x/a.jpg" property="og:image"></head></html>'
-
-    class Resp(io.BytesIO):
-        headers = {"Content-Type": "text/html; charset=utf-8"}
-        def geturl(self):
-            return "https://www.pinterest.com/pin/1/"
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            pass
-    monkeypatch.setattr(main, "_public_host", lambda url: True)
-    monkeypatch.setattr(main._opener, "open", lambda req, timeout: Resp(page))
+    monkeypatch.setattr(main, "_safe_get", lambda url, max_bytes, **kwargs:
+                        (200, {"Content-Type": "text/html; charset=utf-8"}, page, "https://www.pinterest.com/pin/1/"))
     asked = []
     monkeypatch.setattr(main, "_fetch_photo", lambda url: asked.append(url) or b"jpeg")
     assert main._fetch_page_photo("https://pin.it/abc") == b"jpeg" and asked == ["https://i.pinimg.com/736x/a.jpg"]
-    monkeypatch.setattr(main, "_public_host", lambda url: False)
-    assert main._fetch_page_photo("https://192.168.1.1/") is None
 
 
 def test_style_profile_rewritten_and_edited(client, monkeypatch):
@@ -633,13 +635,8 @@ def test_board_pins_from_its_feed(monkeypatch):
       <item><link>https://www.pinterest.com/pin/2/</link><description>Geen foto</description></item>
     </channel></rss>"""
 
-    class Resp(io.BytesIO):
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            pass
-    monkeypatch.setattr(main, "_public_host", lambda url: True)
-    monkeypatch.setattr(main._opener, "open", lambda req, timeout: Resp(feed))
+    monkeypatch.setattr(main, "_safe_get", lambda url, max_bytes, **kwargs:
+                        (200, {"Content-Type": "application/rss+xml"}, feed, url))
     assert main._board_pins("https://www.pinterest.com/laurens/outfits.rss") == [("https://www.pinterest.com/pin/1/", "https://i.pinimg.com/236x/aa/a.jpg")]
     asked = []
     monkeypatch.setattr(main, "_fetch_photo", lambda url: asked.append(url) or (b"jpeg" if "236x" in url else None))

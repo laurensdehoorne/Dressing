@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import html
+import http.client
 import io
 import ipaddress
 import json
@@ -11,6 +12,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import sqlite3
 import subprocess
 import time
@@ -39,7 +41,8 @@ BACKUPS_TO_KEEP = 14
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
-    tasks = [asyncio.create_task(_daily_maintenance()), asyncio.create_task(push.question_loop())]
+    tasks = [asyncio.create_task(_daily_maintenance()), asyncio.create_task(_job_cleanup()),
+             asyncio.create_task(push.question_loop())]
     yield
     for task in tasks:
         task.cancel()
@@ -74,6 +77,7 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
 
 # The most a request may send; only a signed-in account may upload photos.
 MAX_BODY, MAX_UPLOAD = 1_000_000, 30_000_000
+MAX_IMAGE_PIXELS = 24_000_000
 UPLOADS = {"/api/identify", "/api/order/pdf", "/api/order/screenshots", "/api/inspiration"}
 
 
@@ -155,7 +159,11 @@ def _jpeg(data: bytes, max_side: int, quality: int = 80) -> bytes:
     """Decodes any uploaded image, applies EXIF rotation, scales it down and re-encodes as JPEG."""
     try:
         img = Image.open(io.BytesIO(data))
+        if img.width * img.height > MAX_IMAGE_PIXELS:
+            raise HTTPException(413, "Deze afbeelding heeft te veel pixels. Verklein ze en probeer opnieuw.")
         img = ImageOps.exif_transpose(img).convert("RGB")
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(400, "Dit bestand kon niet als foto gelezen worden.")
     img.thumbnail((max_side, max_side))
@@ -720,6 +728,28 @@ def delete_rejected(rejected_id: str, user: User):
 
 _jobs: dict[str, dict] = {}
 JOB_SECONDS = 30 * 60
+MAX_JOBS = 128
+
+
+def _clean_jobs(now: float | None = None, for_new_job: bool = False) -> None:
+    now = time.monotonic() if now is None else now
+    for job, record in list(_jobs.items()):
+        if now - record["at"] > JOB_SECONDS:
+            _jobs.pop(job, None)
+            if not record["task"].done():
+                record["task"].cancel()
+    if for_new_job:
+        while len(_jobs) >= MAX_JOBS:
+            oldest, record = min(_jobs.items(), key=lambda pair: pair[1]["at"])
+            _jobs.pop(oldest, None)
+            if not record["task"].done():
+                record["task"].cancel()
+
+
+async def _job_cleanup():
+    while True:
+        _clean_jobs()
+        await asyncio.sleep(60)
 
 
 async def _analysis(user: dict, task: str, work):
@@ -742,8 +772,7 @@ async def _background(request: Request, user: dict, work):
     if request.query_params.get("background") != "1":
         return await work
     now = time.monotonic()
-    for old in [j for j, x in _jobs.items() if now - x["at"] > JOB_SECONDS]:
-        _jobs.pop(old)["task"].cancel()
+    _clean_jobs(now, for_new_job=True)
     job, progress = secrets.token_urlsafe(18), {}
     token = claude.PROGRESS.set(progress)  # the task takes this along: what the analysis reports lands here
     try:
@@ -755,6 +784,7 @@ async def _background(request: Request, user: dict, work):
 
 @app.get("/api/jobs/{job}")
 async def job_result(job: str, user: User):
+    _clean_jobs()
     found = _jobs.get(job)
     if not found or found["user"] != user["id"]:
         raise HTTPException(404, "Deze analyse is niet meer beschikbaar. Probeer opnieuw.")
@@ -791,7 +821,12 @@ async def _identify(user: dict, raw: bytes, hint: str):
     token = upload = None
     if raw:
         upload, token = await asyncio.to_thread(_keep_photo, raw)
-    return {"info": await claude.identify_item(user, upload, hint.strip() or None), "photo_token": token}
+    try:
+        return {"info": await claude.identify_item(user, upload, hint.strip() or None), "photo_token": token}
+    except BaseException:
+        if token:
+            (db.TMP_DIR / f"{token}.jpg").unlink(missing_ok=True)
+        raise
 
 
 class OrderIn(BaseModel):
@@ -839,6 +874,15 @@ async def read_order_screenshots(user: AIUser, request: Request, shots: list[Upl
     if len(shots) > MAX_SHOTS:
         raise HTTPException(400, f"Kies hoogstens {MAX_SHOTS} screenshots.")
     raws = [await shot.read() for shot in shots]
+    pixels = 0
+    for raw in raws:
+        try:
+            image = Image.open(io.BytesIO(raw))
+            pixels += image.width * image.height
+        except Exception:
+            raise HTTPException(400, "Een screenshot kon niet als foto gelezen worden.")
+        if pixels > MAX_IMAGE_PIXELS:
+            raise HTTPException(413, "Deze screenshots bevatten samen te veel pixels. Kies minder of kleinere afbeeldingen.")
     originals = await asyncio.to_thread(lambda: [Image.open(io.BytesIO(_jpeg(raw, 3000, 90))) for raw in raws])
     return await _background(request, user, _analysis(user, "bestelling", _read_screenshots(user, originals)))
 
@@ -884,6 +928,7 @@ def _pdf_contents(raw: bytes) -> tuple[str, dict[int, bytes]]:
     except Exception:
         raise HTTPException(400, "Dit bestand kon niet als PDF gelezen worden.")
     text, photos = [], {}
+    pixel_budget = MAX_IMAGE_PIXELS
     for page in pages:
         try:
             text.append(page.extract_text() or "")
@@ -897,7 +942,12 @@ def _pdf_contents(raw: bytes) -> tuple[str, dict[int, bytes]]:
             if len(photos) >= MAX_ORDER_PHOTOS:
                 break
             try:
-                size = Image.open(io.BytesIO(image.data)).size
+                source = Image.open(io.BytesIO(image.data))
+                pixels = source.width * source.height
+                if pixels > pixel_budget:
+                    continue
+                pixel_budget -= pixels
+                size = source.size
                 if min(size) >= 12:  # colour swatches count: the AI reads the colour from them
                     photos[len(photos) + 1] = _jpeg(image.data, 1200, 85)
             except Exception:
@@ -908,36 +958,81 @@ def _pdf_contents(raw: bytes) -> tuple[str, dict[int, bytes]]:
 def _public_host(url: str) -> bool:
     """Only https to an address on the internet: never this server, the tailnet or the home network."""
     parts = urllib.parse.urlsplit(url)
-    if parts.scheme != "https" or not parts.hostname:
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
         return False
     try:
         found = socket.getaddrinfo(parts.hostname, parts.port or 443, type=socket.SOCK_STREAM)
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError, ValueError):
         return False
     return bool(found) and all(ipaddress.ip_address(f[4][0]).is_global for f in found)
 
 
-class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not _public_host(newurl):
-            raise urllib.error.URLError("redirect to a private address")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+def _public_addresses(url: str) -> tuple[urllib.parse.SplitResult, list[str]] | None:
+    """Resolve and validate once; the same address list is used by the socket connection."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+            return None
+        resolved = socket.getaddrinfo(parts.hostname, parts.port or 443, type=socket.SOCK_STREAM)
+        addresses = list(dict.fromkeys(ipaddress.ip_address(row[4][0]).compressed for row in resolved))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return (parts, addresses) if addresses and all(ipaddress.ip_address(ip).is_global for ip in addresses) else None
 
 
-_opener = urllib.request.build_opener(_CheckedRedirect)
+def _safe_get(url: str, max_bytes: int, timeout: int = 10, image_max_bytes: int | None = None) -> tuple[int, object, bytes, str] | None:
+    """HTTPS GET with DNS-pinned public IPs and the original hostname for TLS and Host validation."""
+    current = url
+    for _ in range(6):
+        resolved = _public_addresses(current)
+        if not resolved:
+            return None
+        parts, addresses = resolved
+        host, port = parts.hostname, parts.port or 443
+        path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+        conn = None
+        try:
+            class PinnedHTTPSConnection(http.client.HTTPSConnection):
+                def connect(self):
+                    last_error = None
+                    for address in addresses:
+                        try:
+                            sock = socket.create_connection((address, port), timeout=self.timeout)
+                            self.sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+                            return
+                        except OSError as exc:
+                            last_error = exc
+                    if last_error:
+                        raise last_error
+
+            conn = PinnedHTTPSConnection(host, port, timeout=timeout, context=ssl.create_default_context())
+            conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0 (compatible; Dressing)",
+                                                "Accept": "image/*, text/html, application/rss+xml, text/xml"})
+            response = conn.getresponse()
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.getheader("Location")
+                if not location:
+                    return response.status, response.headers, b"", current
+                current = urllib.parse.urljoin(current, location)
+                continue
+            limit = image_max_bytes if image_max_bytes is not None and response.getheader("Content-Type", "").startswith("image/") else max_bytes
+            body = response.read(limit + 1)
+            return response.status, response.headers, body, current
+        except (OSError, ValueError, ssl.SSLError, http.client.HTTPException):
+            return None
+        finally:
+            if conn:
+                conn.close()
+    return None
 
 
 def _fetch_photo(url: str) -> bytes | None:
     """A picture from a web shop's mail, or None when it can't be had (gone, not a picture, too large)."""
-    if not _public_host(url):
+    result = _safe_get(url, MAX_UPLOAD, timeout=10)
+    if not result:
         return None
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Dressing)", "Accept": "image/*"})
-    try:
-        with _opener.open(req, timeout=10) as resp:
-            if not resp.headers.get("Content-Type", "").startswith("image/"):
-                return None
-            data = resp.read(MAX_UPLOAD + 1)
-    except (OSError, ValueError):
+    status, headers, data, _ = result
+    if status != 200 or not headers.get("Content-Type", "").startswith("image/"):
         return None
     if len(data) > MAX_UPLOAD:
         return None
@@ -955,15 +1050,13 @@ CONTENT = re.compile(r"""\bcontent\s*=\s*["']([^"']+)["']""", re.I)
 def _fetch_page_photo(url: str) -> bytes | None:
     """The picture behind a link: the link itself when it is a picture, else the page's preview picture (og:image), as
     a Pinterest pin has. None when there is none, or the page hides it (Instagram, without signing in)."""
-    if not _public_host(url):
+    result = _safe_get(url, PAGE_BYTES, timeout=10, image_max_bytes=MAX_UPLOAD)
+    if not result:
         return None
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Dressing)", "Accept": "text/html,image/*"})
-    try:
-        with _opener.open(req, timeout=10) as resp:
-            kind, final = resp.headers.get("Content-Type", ""), resp.geturl()
-            data = resp.read(MAX_UPLOAD + 1 if kind.startswith("image/") else PAGE_BYTES)
-    except (OSError, ValueError):
+    status, headers, data, final = result
+    if status != 200:
         return None
+    kind = headers.get("Content-Type", "")
     if kind.startswith("image/"):
         try:
             return _jpeg(data, 3000, 90) if len(data) <= MAX_UPLOAD else None
@@ -1023,13 +1116,10 @@ def _pinterest(host: str) -> bool:
 
 def _resolve(url: str) -> str:
     """Where a short link (pin.it) leads; any other link as it is."""
-    if urllib.parse.urlsplit(url).hostname != "pin.it" or not _public_host(url):
+    if urllib.parse.urlsplit(url).hostname != "pin.it":
         return url
-    try:
-        with _opener.open(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Dressing)"}), timeout=10) as resp:
-            return resp.geturl()
-    except (OSError, ValueError):
-        return url
+    result = _safe_get(url, PAGE_BYTES, timeout=10)
+    return result[3] if result and result[0] in (200, 301, 302, 303, 307, 308) else url
 
 
 def _board_feed(url: str) -> str | None:
@@ -1043,13 +1133,12 @@ def _board_feed(url: str) -> str | None:
 
 def _board_pins(feed: str) -> list[tuple[str, str]]:
     """The pins on a public board, newest first: (link to the pin, its picture in the feed)."""
-    if not _public_host(feed):
+    result = _safe_get(feed, PAGE_BYTES, timeout=15)
+    if not result or result[0] != 200:
         return []
-    req = urllib.request.Request(feed, headers={"User-Agent": "Mozilla/5.0 (compatible; Dressing)", "Accept": "application/rss+xml, text/xml"})
     try:
-        with _opener.open(req, timeout=15) as resp:
-            root = ET.fromstring(resp.read(PAGE_BYTES))
-    except (OSError, ValueError, ET.ParseError):
+        root = ET.fromstring(result[2])
+    except ET.ParseError:
         return []
     pins = []
     for item in root.iter("item"):

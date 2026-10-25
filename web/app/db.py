@@ -1,6 +1,7 @@
 """SQLite storage. Clothing details live in a JSON column so fields can grow without migrations."""
 
 import json
+import math
 import os
 import sqlite3
 import uuid
@@ -217,7 +218,8 @@ def clean_item(data: dict) -> dict:
             out[key] = str(out[key] or "").strip()[:2000]
     if "price" in out:
         try:
-            out["price"] = round(float(out["price"]), 2) if out["price"] not in (None, "") else None
+            price = float(out["price"]) if out["price"] not in (None, "") else None
+            out["price"] = round(price, 2) if price is not None and math.isfinite(price) else None
         except (TypeError, ValueError):
             out["price"] = None
     return out
