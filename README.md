@@ -42,7 +42,9 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
 - **Gedragen**: noteer wat je droeg (vanuit een voorstel, bij een stuk of zelf samengesteld), met datum,
   seizoen, temperatuur, gelegenheid, sterren en notitie. De stylist gebruikt die geschiedenis bij volgende voorstellen;
   de temperatuur wordt ingevuld als het lokale weer beschikbaar is en kan je zelf aanpassen.
-  Scores en afwijzingen bouwen automatisch een korte voorkeurssamenvatting op de server, zonder extra AI-aanroepen.
+  Scores en afwijzingen bouwen lokaal een korte voorkeurssamenvatting op. Bij voldoende nieuwe feedback mag de stylist
+  daar maximaal één helper-modelaanroep per 30 dagen aan besteden; die ene aanroep heeft een begrensde invoer en uitvoer
+  en verschijnt apart in het AI-gebruiksoverzicht.
 - **Actuele trends**: de stylist haalt trendartikelen op van British Vogue en Who What Wear in een gedeelde cache,
   hoogstens eens per 30 dagen. De titels en korte beschrijvingen gaan mee met de gewone outfitvraag; de bronlinks staan bij het advies.
 - **Outfit rond dit stuk**: vanuit een kledingstuk meteen een outfit eromheen vragen.

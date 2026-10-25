@@ -133,6 +133,33 @@ def test_outfit_feedback_learns_locally_without_extra_ai_calls(client):
     assert "Te formeel" in main.auth.user_settings(user)["learned_profile"]
 
 
+def test_ai_learning_runs_in_background_at_most_once_per_month(client, monkeypatch):
+    user = client.get("/api/state").json()["user"]
+    main.auth.put_user_setting(user, "learning_dirty", True)
+    main.auth.put_user_setting(user, "learning_revision", 1)
+    calls = []
+
+    async def fake_learn(user, history):
+        calls.append(history)
+        return {"samenvatting": "Houdt van zachte kleuren en nette laagjes."}
+    monkeypatch.setattr(main.claude, "learn_style", fake_learn)
+    monkeypatch.setattr(main, "LEARNING_BACKGROUND_DELAY_SECONDS", 0)
+    worn = [{"item_ids": [], "item_snapshots": [], "date": "2026-10-01", "rating": 5}]
+
+    async def run_learning():
+        main._schedule_learning(user, main.auth.user_settings(user), worn, [], "goed beoordeeld")
+        await main._learning_tasks[user["id"]]
+        main._schedule_learning(user, main.auth.user_settings(user), worn, [], "goed beoordeeld")
+
+    import asyncio
+    asyncio.run(run_learning())
+    settings = main.auth.user_settings(user)
+    assert len(calls) == 1
+    assert settings["learned_profile_ai"] == "Houdt van zachte kleuren en nette laagjes."
+    assert settings["learning_dirty"] is False
+    assert main._learning_due({"learning_dirty": True, "learning_ai_attempted_at": settings["learning_ai_attempted_at"]}) is False
+
+
 def test_worn_history_keeps_item_snapshots_after_item_deletion(client):
     item = add(client, name="Groene linnen blouse", colors=["groen"], brand="Atelier")
     worn = client.post("/api/worn", json={"item_ids": [item["id"]], "occasion": "zomerfeest"}, headers=H).json()

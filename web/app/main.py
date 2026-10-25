@@ -37,6 +37,9 @@ from . import audit, auth, claude, costs, db, gpt, keys, push, trends, weather
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 BACKUPS_TO_KEEP = 14
+LEARNING_INTERVAL = timedelta(days=30)
+LEARNING_BACKGROUND_DELAY_SECONDS = 5
+_learning_tasks: dict[str, asyncio.Task] = {}
 
 
 @asynccontextmanager
@@ -46,6 +49,8 @@ async def lifespan(app: FastAPI):
              asyncio.create_task(push.question_loop()), asyncio.create_task(_trend_refresh_loop())]
     yield
     for task in tasks:
+        task.cancel()
+    for task in _learning_tasks.values():
         task.cancel()
 
 
@@ -651,18 +656,84 @@ def _learned_outfit_profile(worn: list[dict], rejected: list[dict]) -> str:
     return "; ".join(parts)[:700]
 
 
-def _refresh_outfit_learning(user_id: str) -> None:
+def _refresh_outfit_learning(user_id: str, *, changed: bool = True) -> None:
     with db.connect() as conn:
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user_id,))]
         rejected = [db.rejected_row(r) for r in _rejected(conn, {"id": user_id})]
-    auth.put_user_setting({"id": user_id}, "learned_profile", _learned_outfit_profile(worn, rejected) or None)
+    settings = auth.user_settings({"id": user_id})
+    profile = _learned_outfit_profile(worn, rejected) or None
+    if profile != settings.get("learned_profile"):
+        auth.put_user_setting({"id": user_id}, "learned_profile", profile)
+        changed = True  # existing history needs its first AI interpretation too
+    if changed:
+        auth.put_user_setting({"id": user_id}, "learning_dirty", True)
+        auth.put_user_setting({"id": user_id}, "learning_revision", int(settings.get("learning_revision") or 0) + 1)
 
 
 def _refresh_all_outfit_learning() -> None:
     with db.connect() as conn:
         user_ids = [r["id"] for r in conn.execute("SELECT id FROM users")]
     for user_id in user_ids:
-        _refresh_outfit_learning(user_id)
+        _refresh_outfit_learning(user_id, changed=False)
+
+
+def _learning_due(settings: dict, now: datetime | None = None) -> bool:
+    if not settings.get("learning_dirty"):
+        return False
+    try:
+        attempted = datetime.fromisoformat(settings.get("learning_ai_attempted_at", ""))
+        if attempted.tzinfo is None:
+            attempted = attempted.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        attempted = None
+    now = now or datetime.now(timezone.utc)
+    return attempted is None or now - attempted.astimezone(timezone.utc) >= LEARNING_INTERVAL
+
+
+def _learning_input(worn: list[dict], rejected: list[dict], local_profile: str) -> str:
+    lines = [f"Lokale samenvatting van alle feedback: {local_profile}", "Recente gedragen outfits:"]
+    for log in worn[:35]:
+        names = {x.get("id"): x.get("name") or x.get("kind") or "kledingstuk" for x in log.get("item_snapshots", [])}
+        items = ", ".join(names.get(i, "kledingstuk") for i in log.get("item_ids", []))
+        detail = [log.get("date", ""), items]
+        if log.get("season"): detail.append(log["season"])
+        if log.get("temperature") is not None: detail.append(f"{log['temperature']} °C")
+        if log.get("occasion"): detail.append(log["occasion"][:60])
+        if log.get("rating"): detail.append(f"score {log['rating']}/5")
+        if log.get("note"): detail.append(f"notitie: {log['note'][:70]}")
+        lines.append("- " + " · ".join(detail))
+    if rejected:
+        lines.append("Feedback op afgewezen voorstellen:")
+        lines.extend(f"- {', '.join(r.get('reasons', []))}: {r.get('note', '')[:80]}" for r in rejected[:20])
+    return "\n".join(lines)[:6000]
+
+
+def _schedule_learning(user: dict, settings: dict, worn: list[dict], rejected: list[dict], local_profile: str) -> None:
+    """At most one helper-model interpretation per user per month, only after closet feedback changes."""
+    user_id = user["id"]
+    if len(worn) < 3 and not rejected and not any(log.get("rating") for log in worn):
+        return  # wait for enough signal to make the extra call useful
+    if not _learning_due(settings) or (_learning_tasks.get(user_id) and not _learning_tasks[user_id].done()):
+        return
+    revision = int(settings.get("learning_revision") or 0)
+    auth.put_user_setting(user, "learning_ai_attempted_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    history = _learning_input(worn, rejected, local_profile)
+
+    async def run() -> None:
+        try:
+            await asyncio.sleep(LEARNING_BACKGROUND_DELAY_SECONDS)  # let the regular outfit suggestion finish first
+            result = await _analysis(user, "voorkeurssamenvatting", claude.learn_style(user, history))
+            summary = result.get("samenvatting", "") if isinstance(result, dict) else ""
+            auth.put_user_setting(user, "learned_profile_ai", summary or None)
+            latest = auth.user_settings(user)
+            if int(latest.get("learning_revision") or 0) == revision:
+                auth.put_user_setting(user, "learning_dirty", False)
+        except Exception as e:
+            print(f"background outfit learning failed: {e!r}")
+
+    task = asyncio.create_task(run())
+    _learning_tasks[user_id] = task
+    task.add_done_callback(lambda done: _learning_tasks.pop(user_id, None) if _learning_tasks.get(user_id) is done else None)
 
 
 class WornIn(BaseModel):
@@ -1516,9 +1587,14 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
         items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ?", (user["id"],))]
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ?", (user["id"],))]
         rejected = [db.rejected_row(r) for r in _rejected(conn, user, claude.REJECTED_SHOWN)]
+    local_profile = settings.get("learned_profile") or ""
+    _schedule_learning(user, settings, worn, rejected, local_profile)
+    learned = local_profile
+    if settings.get("learned_profile_ai"):
+        learned += "\nAI-interpretatie van patronen: " + settings["learned_profile_ai"]
     trend_text, trend_sources = trends.context()
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
-                                          style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None, trends=trend_text, learned=settings.get("learned_profile") or "")
+                                          style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None, trends=trend_text, learned=learned)
     return {**result, "weather": forecast, "elsewhere": elsewhere, "trend_sources": trend_sources}
 
 

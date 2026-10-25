@@ -213,7 +213,7 @@ def _function(tool: dict) -> dict:
 
 
 async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: list, effort: str, helpers: Helpers,
-                              name: str) -> dict:
+                              name: str, max_turns: int = 3, max_output_tokens: int = 16000) -> dict:
     """Asks model `name` until it calls the tool's function, then returns that call's arguments (as claude._ask); a
     helper it calls on the way is answered and the conversation goes on."""
     tool_name = tool["name"]
@@ -221,10 +221,10 @@ async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: l
     # `instructions` can't hold a breakpoint, so they go in as a developer message.
     fixed = {"role": "developer", "content": [{"type": "input_text", "text": system, "prompt_cache_breakpoint": CACHED}]}
     common = {"model": name, "tools": [_function(tool), *(_function(t) for t, _ in helpers.values())],
-              "max_output_tokens": 16000, "reasoning": {"effort": effort},
+              "max_output_tokens": max_output_tokens, "reasoning": {"effort": effort},
               "prompt_cache_options": CACHED, "prompt_cache_key": f"dressing-{tool_name}"}
     kwargs = {**common, "input": [fixed, {"role": "user", "content": _content(content)}], "tool_choice": "auto"}
-    for _ in range(3 + 2 * bool(helpers)):
+    for _ in range(max_turns + 2 * bool(helpers)):
         try:
             response = await _create(user, **kwargs)
         except ClaudeError:
