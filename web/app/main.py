@@ -33,7 +33,7 @@ import pypdf
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
-from . import audit, auth, claude, costs, db, gpt, keys, push, weather
+from . import audit, auth, claude, costs, db, gpt, keys, push, trends, weather
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 BACKUPS_TO_KEEP = 14
@@ -43,7 +43,7 @@ BACKUPS_TO_KEEP = 14
 async def lifespan(app: FastAPI):
     db.init()
     tasks = [asyncio.create_task(_daily_maintenance()), asyncio.create_task(_job_cleanup()),
-             asyncio.create_task(push.question_loop())]
+             asyncio.create_task(push.question_loop()), asyncio.create_task(_trend_refresh_loop())]
     yield
     for task in tasks:
         task.cancel()
@@ -613,6 +613,58 @@ async def set_item_photo(item_id: str, user: User, photo: UploadFile = File(...)
 
 # MARK: - Worn (outfits that were worn)
 
+def _learned_outfit_profile(worn: list[dict], rejected: list[dict]) -> str:
+    """Cheap local preference learning; capped and deterministic, with no model/API call."""
+    if not worn and not rejected:
+        return ""
+    from collections import Counter
+    good_items, poor_items, good_seasons, good_occasions, reject_reasons = Counter(), Counter(), Counter(), Counter(), Counter()
+    good_temps = []
+    for log in worn:
+        snapshots = {x.get("id"): x for x in log.get("item_snapshots", []) if isinstance(x, dict)}
+        names = [snapshots.get(i, {}).get("name") or snapshots.get(i, {}).get("kind") for i in log.get("item_ids", [])]
+        names = [name for name in names if name]
+        score = log.get("rating")
+        if score and score >= 4:
+            good_items.update(names)
+            if log.get("season"): good_seasons.update([log["season"]])
+            if log.get("occasion"): good_occasions.update([log["occasion"]])
+            if isinstance(log.get("temperature"), (int, float)): good_temps.append(log["temperature"])
+        elif score and score <= 2:
+            poor_items.update(names)
+    for log in rejected:
+        reject_reasons.update(r for r in log.get("reasons", []) if r)
+    parts = [f"{len(worn)} gelogde outfits"] if worn else []
+    if good_items:
+        parts.append("goed beoordeeld: " + ", ".join(f"{n} ({c}×)" for n, c in good_items.most_common(4)))
+    if poor_items:
+        parts.append("laag beoordeeld: " + ", ".join(f"{n} ({c}×)" for n, c in poor_items.most_common(3)))
+    if good_seasons:
+        parts.append("goede outfits in " + ", ".join(f"{s} ({c}×)" for s, c in good_seasons.most_common(3)))
+    if good_occasions:
+        parts.append("goed beoordeeld voor " + ", ".join(f"{o} ({c}×)" for o, c in good_occasions.most_common(3)))
+    if good_temps:
+        temperature_range = f"{min(good_temps):g} °C" if min(good_temps) == max(good_temps) else f"{min(good_temps):g}–{max(good_temps):g} °C"
+        parts.append(f"goed beoordeeld bij {temperature_range}")
+    if reject_reasons:
+        parts.append("afwijzingsfeedback: " + ", ".join(f"{r} ({c}×)" for r, c in reject_reasons.most_common(3)))
+    return "; ".join(parts)[:700]
+
+
+def _refresh_outfit_learning(user_id: str) -> None:
+    with db.connect() as conn:
+        worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user_id,))]
+        rejected = [db.rejected_row(r) for r in _rejected(conn, {"id": user_id})]
+    auth.put_user_setting({"id": user_id}, "learned_profile", _learned_outfit_profile(worn, rejected) or None)
+
+
+def _refresh_all_outfit_learning() -> None:
+    with db.connect() as conn:
+        user_ids = [r["id"] for r in conn.execute("SELECT id FROM users")]
+    for user_id in user_ids:
+        _refresh_outfit_learning(user_id)
+
+
 class WornIn(BaseModel):
     item_ids: list[str]
     date: str = ""
@@ -662,7 +714,9 @@ def _add_worn(body: WornIn, user: dict) -> dict:
         push.ask_later(conn, user["id"], day, data)  # "Hoe viel je outfit?" this evening, without a score
         log_id = db.new_id()
         conn.execute("INSERT INTO worn (id, user_id, date, data) VALUES (?, ?, ?, ?)", (log_id, user["id"], day, json.dumps(data)))
-        return db.worn_row(conn.execute("SELECT * FROM worn WHERE id = ?", (log_id,)).fetchone())
+        result = db.worn_row(conn.execute("SELECT * FROM worn WHERE id = ?", (log_id,)).fetchone())
+    _refresh_outfit_learning(user["id"])
+    return result
 
 
 @app.put("/api/worn/{log_id}")
@@ -676,7 +730,9 @@ def update_worn(log_id: str, body: WornIn, user: User):
             body = body.model_copy(update={"temperature": old_data["temperature"]})
         day, data = _worn_data(conn, body, user, old_data.get("item_snapshots"))
         conn.execute("UPDATE worn SET date = ?, data = ? WHERE id = ?", (day, json.dumps(data), log_id))
-        return db.worn_row(conn.execute("SELECT * FROM worn WHERE id = ?", (log_id,)).fetchone())
+        result = db.worn_row(conn.execute("SELECT * FROM worn WHERE id = ?", (log_id,)).fetchone())
+    _refresh_outfit_learning(user["id"])
+    return result
 
 
 @app.delete("/api/worn/{log_id}")
@@ -684,6 +740,7 @@ def delete_worn(log_id: str, user: User):
     with db.connect() as conn:
         if not conn.execute("DELETE FROM worn WHERE id = ? AND user_id = ?", (log_id, user["id"])).rowcount:
             raise HTTPException(404, "Outfit niet gevonden.")
+    _refresh_outfit_learning(user["id"])
     return {"ok": True}
 
 
@@ -726,7 +783,9 @@ def _add_rejected(body: RejectedIn, user: dict) -> dict:
         conn.execute("INSERT INTO rejected (id, user_id, at, data) VALUES (?, ?, ?, ?)", (rejected_id, user["id"], db.now_iso(), json.dumps(data)))
         conn.execute("DELETE FROM rejected WHERE user_id = ? AND id NOT IN (SELECT id FROM rejected WHERE user_id = ? "
                      "ORDER BY at DESC, rowid DESC LIMIT ?)", (user["id"], user["id"], REJECTED_KEPT))
-        return db.rejected_row(conn.execute("SELECT * FROM rejected WHERE id = ?", (rejected_id,)).fetchone())
+        result = db.rejected_row(conn.execute("SELECT * FROM rejected WHERE id = ?", (rejected_id,)).fetchone())
+    _refresh_outfit_learning(user["id"])
+    return result
 
 
 @app.delete("/api/rejected/{rejected_id}")
@@ -735,6 +794,7 @@ def delete_rejected(rejected_id: str, user: User):
     with db.connect() as conn:
         if not conn.execute("DELETE FROM rejected WHERE id = ? AND user_id = ?", (rejected_id, user["id"])).rowcount:
             raise HTTPException(404, "Deze afkeuring bestaat niet meer.")
+    _refresh_outfit_learning(user["id"])
     return {"ok": True}
 
 
@@ -771,6 +831,25 @@ async def _job_cleanup():
     while True:
         _clean_jobs()
         await asyncio.sleep(60)
+
+
+async def _trend_refresh_loop():
+    """Refresh the shared fashion trend cache in the background at most every thirty days."""
+    cache_file = db.DATA_DIR / "fashion-trends.json"
+    trends.restore(cache_file)
+    await asyncio.to_thread(_refresh_all_outfit_learning)
+    await asyncio.sleep(5)  # let the app start immediately; the current cache is used meanwhile
+    while True:
+        def fetch(url: str) -> bytes | None:
+            result = _safe_get(url, 500_000, timeout=12)
+            if not result or result[0] != 200 or len(result[2]) > 500_000:
+                return None
+            return result[2]
+        try:
+            await asyncio.to_thread(trends.refresh, cache_file, fetch)
+        except Exception as e:
+            print(f"trend refresh failed: {e!r}")
+        await asyncio.sleep(trends.REFRESH_SECONDS)
 
 
 async def _analysis(user: dict, task: str, work):
@@ -1437,9 +1516,10 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
         items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ?", (user["id"],))]
         worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ?", (user["id"],))]
         rejected = [db.rejected_row(r) for r in _rejected(conn, user, claude.REJECTED_SHOWN)]
+    trend_text, trend_sources = trends.context()
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
-                                          style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None)
-    return {**result, "weather": forecast, "elsewhere": elsewhere}
+                                          style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None, trends=trend_text, learned=settings.get("learned_profile") or "")
+    return {**result, "weather": forecast, "elsewhere": elsewhere, "trend_sources": trend_sources}
 
 
 class PictureIn(BaseModel):

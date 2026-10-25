@@ -647,6 +647,7 @@ function outfitsHTML(r) {
       : `Nog geen voorspelling voor ${h(name)}: de stylist gaat uit van het gebruikelijke weer daar`}</span></div>`;
   }).join("");
   return `${elsewhere}${r.advice ? `<p class="advice">${h(r.advice)}</p>` : ""}
+    ${r.trend_sources?.length ? `<p class="footnote">Actuele trendartikelen (cache van ${h(r.trend_sources[0].updated)}): ${[...new Map(r.trend_sources.map((s) => [s.source, s])).values()].map((s) => `<a href="${h(s.url)}" target="_blank" rel="noopener noreferrer">${h(s.source)}</a>`).join(" · ")}</p>` : ""}
     ${r.outfits.map((o, n) => `<article class="card outfit${o.rejected ? " rejected" : ""}">
       <div class="head"><span class="n">Outfit ${n + 1}</span><h2>${h(o.title)}</h2></div>
       <div class="pieces">${o.item_ids.map(piece).join("")}</div>

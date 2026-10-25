@@ -121,6 +121,18 @@ def test_worn_logs_season_temperature_and_preserves_temperature_when_edited(clie
     assert client.post("/api/worn", json={"item_ids": [item["id"]], "temperature": 100}, headers=H).status_code == 400
 
 
+def test_outfit_feedback_learns_locally_without_extra_ai_calls(client):
+    item = add(client, name="Zachte groene trui")
+    worn = client.post("/api/worn", json={"item_ids": [item["id"]], "date": "2026-10-12", "rating": 5,
+                                            "occasion": "kantoor", "temperature": 12}, headers=H)
+    assert worn.status_code == 200
+    user = client.get("/api/state").json()["user"]
+    learned = main.auth.user_settings(user)["learned_profile"]
+    assert "Zachte groene trui" in learned and "herfst" in learned and "kantoor" in learned and "bij 12 °C" in learned
+    assert client.post("/api/rejected", json={"item_ids": [item["id"]], "reasons": ["Te formeel"]}, headers=H).status_code == 200
+    assert "Te formeel" in main.auth.user_settings(user)["learned_profile"]
+
+
 def test_worn_history_keeps_item_snapshots_after_item_deletion(client):
     item = add(client, name="Groene linnen blouse", colors=["groen"], brand="Atelier")
     worn = client.post("/api/worn", json={"item_ids": [item["id"]], "occasion": "zomerfeest"}, headers=H).json()
@@ -884,6 +896,23 @@ def test_stylist_includes_every_worn_outfit_past_the_old_history_limit(client, m
     history = seen["text"].split("Wat ik eerder droeg en hoe het viel:\n")[1].split("\n\n")[0].splitlines()
     assert len(history) == 30
     assert history[-1].startswith(first_day.isoformat())
+
+
+def test_stylist_receives_cached_trends_with_its_existing_ai_request(client, monkeypatch):
+    item = add(client)
+    client.put("/api/settings/place", json={"place": ""}, headers=H)
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
+        seen["text"] = "\n".join(c["text"] for c in content)
+        return {"advies": "Fris.", "outfits": [{"titel": "Look", "stukken": [item["id"]], "waarom": "Past."}]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    monkeypatch.setattr(main.trends, "context", lambda: ("Trenddata: bruine tinten en laagjes", [
+        {"source": "British Vogue", "title": "Trends", "url": "https://www.vogue.co.uk/article/trends", "updated": "2026-10-25"}]))
+    response = client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
+    assert response.status_code == 200, response.text
+    assert "Trenddata: bruine tinten en laagjes" in seen["text"]
+    assert response.json()["trend_sources"][0]["source"] == "British Vogue"
 
 
 def test_follow_up_keeps_every_outfit(client, monkeypatch):
