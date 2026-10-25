@@ -207,12 +207,13 @@ function filteredItems() {
 
 function itemTile(i, { selectable = false, selected = false, act = "toggle-piece" } = {}) {
   const sub = [i.kind || catLabel(i.category), i.location].filter(Boolean).join(" · ");
-  return `<button class="tile-item${away(i) ? " away" : ""}" data-act="${selectable ? act : "open"}" data-id="${h(i.id)}"
+  const tile = `<button class="tile-item${away(i) ? " away" : ""}" data-act="${selectable ? act : "open"}" data-id="${h(i.id)}"
       ${selectable ? `aria-pressed="${selected}"` : ""}>
       ${i.photo ? `<img class="ph" src="${h(small(i.photo))}" alt="" loading="lazy">` : `<span class="ph none">${ic("shirt")}</span>`}
       ${away(i) ? `<span class="flag">${h(statusLabel(i.status))}</span>` : ""}
-      ${selectable ? `<span class="check" aria-hidden="true">${selected ? "✓" : ""}</span>` : i.favorite ? `<span class="fav" aria-label="Favoriet">⭐</span>` : ""}
+      ${selectable ? `<span class="check" aria-hidden="true">${selected ? "✓" : ""}</span>` : ""}
       <span class="txt"><span class="name">${h(i.name)}</span><span class="sub">${swatches(i)}${h(sub)}</span></span></button>`;
+  return selectable ? tile : `<div class="tile-wrap">${tile}<button class="favorite-toggle${i.favorite ? " on" : ""}" data-act="toggle-favorite" data-id="${h(i.id)}" aria-label="${i.favorite ? "Verwijder uit favorieten" : "Zet als favoriet"}" aria-pressed="${!!i.favorite}">${i.favorite ? "★" : "☆"}</button></div>`;
 }
 
 function categoryPills(items, current, act) {
@@ -270,6 +271,7 @@ function renderDetail(page) {
     <div class="actions-row">
       <button class="btn-primary" data-act="wear-one" data-id="${h(i.id)}">Vandaag gedragen</button>
       <button class="btn-secondary" data-act="status-sheet" data-id="${h(i.id)}">Waar is het?</button></div>
+    <button class="btn-secondary" style="margin-top:10px" data-act="toggle-favorite" data-id="${h(i.id)}">${i.favorite ? "★ Favoriet · tik om te verwijderen" : "☆ Zet als favoriet"}</button>
     <button class="btn-secondary" style="margin-top:10px" data-act="style-with" data-id="${h(i.id)}">${ic("sparkle")} Outfit rond dit stuk</button>
     ${S.trip ? `<button class="btn-secondary" style="margin-top:10px" data-act="pack-one" data-id="${h(i.id)}">🧳 ${packed(i.id) ? "Uit de valies halen" : `In de valies voor ${h(tripName())}`}</button>` : ""}
     ${i.description ? `<p style="margin:18px 4px 0;line-height:1.45">${h(i.description)}</p>` : ""}
@@ -1270,6 +1272,17 @@ function modelRows(models) {
 const actions = {
   tab: (el) => { ui.tab = el.dataset.tab; stack = []; render(); scrollTo(0, 0); if (ui.tab === "stylist" && S.place && !ui.weather) loadWeather(); },
   open: (el) => push({ kind: "detail", id: el.dataset.id }),
+  async "toggle-favorite"(el) {
+    const item = itemById(el.dataset.id);
+    if (!item || el.disabled) return;
+    el.disabled = true;
+    try {
+      const updated = await api(`/api/items/${item.id}`, { method: "PATCH", json: { favorite: !item.favorite } });
+      Object.assign(item, updated);
+      render();
+      toast(item.favorite ? "Favoriet bewaard" : "Favoriet verwijderd");
+    } catch (e) { el.disabled = false; toast(e.message); }
+  },
   back: () => pop(),
   add: () => push({ kind: "add", phase: "pick", hint: "" }),
   sort: () => openSort(),

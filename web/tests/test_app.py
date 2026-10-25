@@ -46,6 +46,15 @@ def test_changes_need_the_app_header(client):
     assert client.post("/api/items", json={"data": {"name": "x"}}).status_code == 403
 
 
+def test_favorite_can_be_toggled_with_a_single_item_patch(client):
+    item = add(client, name="Linnen hemd", favorite=False)
+    favorite = client.patch(f"/api/items/{item['id']}", json={"favorite": True}, headers=H)
+    assert favorite.status_code == 200 and favorite.json()["favorite"] is True
+    assert client.get("/api/state").json()["items"][0]["favorite"] is True
+    unfavorite = client.patch(f"/api/items/{item['id']}", json={"favorite": False}, headers=H)
+    assert unfavorite.status_code == 200 and unfavorite.json()["favorite"] is False
+
+
 def test_identify_keeps_the_photo_for_the_new_item(client, monkeypatch):
     async def fake(user, photo, hint):
         assert photo and hint == "merk Zara"
