@@ -177,6 +177,29 @@ def test_background_ai_settings_control_frequency_and_disable(client):
     assert client.put("/api/settings/background-ai", json={"enabled": True, "interval_days": 10}, headers=H).status_code == 400
 
 
+def test_manual_refresh_summarizes_history_and_forces_trend_refresh(client, monkeypatch):
+    item = add(client, name="Donkerblauwe blazer")
+    client.post("/api/worn", json={"item_ids": [item["id"]], "rating": 5, "occasion": "werk"}, headers=H)
+    calls = {}
+
+    async def fake_learn(user, history):
+        calls["history"] = history
+        return {"samenvatting": "Draagt graag blazers op het werk."}
+
+    def fake_refresh(cache_file, fetch, force=False):
+        calls["force"] = force
+        return True
+
+    monkeypatch.setattr(main.claude, "learn_style", fake_learn)
+    monkeypatch.setattr(main.trends, "refresh", fake_refresh)
+    result = client.post("/api/settings/refresh-learning", headers=H)
+    assert result.status_code == 200, result.text
+    assert result.json()["profile_updated"] is True
+    assert result.json()["trends_updated"] is True
+    assert "Donkerblauwe blazer" in calls["history"] and calls["force"] is True
+    assert main.auth.user_settings(client.get("/api/state").json()["user"])["learned_profile_ai"] == "Draagt graag blazers op het werk."
+
+
 def test_worn_history_keeps_item_snapshots_after_item_deletion(client):
     item = add(client, name="Groene linnen blouse", colors=["groen"], brand="Atelier")
     worn = client.post("/api/worn", json={"item_ids": [item["id"]], "occasion": "zomerfeest"}, headers=H).json()

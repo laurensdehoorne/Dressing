@@ -505,6 +505,48 @@ def set_profile(body: ProfileIn, user: User):
     return {"ok": True}
 
 
+@app.post("/api/settings/refresh-learning")
+async def refresh_learning_and_trends(user: AIUser, request: Request):
+    return await _background(request, user, _refresh_learning_and_trends(user))
+
+
+async def _refresh_learning_and_trends(user: dict) -> dict:
+    """Run an on-demand profile interpretation and force-refresh the shared trend cache."""
+    with db.connect() as conn:
+        worn = [db.worn_row(r) for r in conn.execute("SELECT * FROM worn WHERE user_id = ? ORDER BY date DESC", (user["id"],))]
+        rejected = [db.rejected_row(r) for r in _rejected(conn, user)]
+    _refresh_outfit_learning(user["id"], changed=False)
+    settings = auth.user_settings(user)
+    has_history = bool(worn or rejected)
+
+    async def summarize() -> bool:
+        if not has_history:
+            return False
+        if _learning_tasks.get(user["id"]) and not _learning_tasks[user["id"]].done():
+            return False
+        auth.put_user_setting(user, "learning_ai_attempted_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        local_profile = settings.get("learned_profile") or ""
+        result = await _analysis(user, "voorkeurssamenvatting", claude.learn_style(
+            user, _learning_input(worn, rejected, local_profile)))
+        summary = result.get("samenvatting", "") if isinstance(result, dict) else ""
+        auth.put_user_setting(user, "learned_profile_ai", summary or None)
+        auth.put_user_setting(user, "learning_dirty", False)
+        return bool(summary)
+
+    def fetch(url: str) -> bytes | None:
+        result = _safe_get(url, 500_000, timeout=12)
+        return result[2] if result and result[0] == 200 and len(result[2]) <= 500_000 else None
+
+    async def refresh_trends() -> bool:
+        return await asyncio.to_thread(trends.refresh, db.DATA_DIR / "fashion-trends.json", fetch, force=True)
+
+    profile_result, trends_result = await asyncio.gather(summarize(), refresh_trends(), return_exceptions=True)
+    _, sources = trends.context()
+    return {"profile_updated": profile_result is True, "profile_failed": isinstance(profile_result, Exception),
+            "trends_updated": trends_result is True, "trends_failed": isinstance(trends_result, Exception),
+            "trend_count": len(sources)}
+
+
 class BackgroundAIIn(BaseModel):
     enabled: bool
     interval_days: int

@@ -961,6 +961,8 @@ function renderSettings() {
         </select></div>
     </div>
     <p class="footnote">De AI vat je outfitgeschiedenis op deze frequentie samen als er nieuwe feedback is. Lokale verwerking blijft actief. Modetrends worden apart maandelijks opgehaald.</p>
+    <div class="card"><div class="row"><button class="row-button" data-act="refresh-learning-now" ${ui.learningRefreshBusy ? "disabled" : ""}>${ui.learningRefreshBusy ? "Geschiedenis en trends worden bijgewerkt…" : "Nu outfitgeschiedenis samenvatten en trends ophalen"}</button></div></div>
+    <p class="footnote">De AI-samenvatting gebruikt je ingestelde AI-dienst en kan API-kosten veroorzaken. Trends verversen maximaal eenmaal per 12 uur; normaal gebeurt dit maandelijks.</p>
     <p class="footnote">Maak een sleutel op ${h(service.console || "console.anthropic.com")}. Je kan voor beide diensten een sleutel bewaren
       en wisselen wanneer je wil; de herkenning en de stylist gebruiken de gekozen dienst. Een sleutel wordt versleuteld met je wachtwoord bewaard: niemand anders kan hem lezen.
       Een foto herkennen of een outfit vragen kost meestal minder dan een cent.</p>
@@ -1312,6 +1314,24 @@ const actions = {
     render();
   },
   "worn-all": () => { ui.wornMonth = ""; render(); },
+  async "refresh-learning-now"() {
+    if (ui.learningRefreshBusy) return;
+    ui.learningRefreshBusy = true;
+    render();
+    try {
+      const result = await slowApi("/api/settings/refresh-learning", { method: "POST" });
+      await load();
+      const messages = [];
+      if (result.profile_updated) messages.push("outfitgeschiedenis samengevat");
+      else if (result.profile_failed) messages.push("samenvatten mislukt");
+      else messages.push("geen nieuwe samenvatting nodig of geen outfitgeschiedenis");
+      if (result.trends_updated) messages.push("trends vernieuwd");
+      else if (result.trends_failed) messages.push("trends ophalen mislukt");
+      else messages.push("trends waren recent opgehaald of feeds bevatten niets nieuws");
+      toast(messages.join(" · "));
+    } catch (e) { toast(e.message); }
+    finally { ui.learningRefreshBusy = false; render(); }
+  },
   async "delete-log"() {
     const page = stack.at(-1);
     if (!confirm("Deze outfit verwijderen uit Gedragen?")) return;

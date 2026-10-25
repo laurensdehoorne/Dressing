@@ -16,6 +16,7 @@ FEEDS = (
     ("Who What Wear", "https://feeds.whowhatwear.com/whowhatwear"),
 )
 REFRESH_SECONDS = 30 * 24 * 60 * 60
+FORCED_REFRESH_MIN_SECONDS = 12 * 60 * 60
 MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 MAX_ITEMS_PER_FEED = 3
 _updated_at = 0.0
@@ -95,8 +96,8 @@ def context() -> tuple[str, list[dict]]:
     return prompt, sources
 
 
-def refresh(cache_file: Path, fetch, now: float | None = None) -> bool:
-    """Refresh at most twice a day across restarts; fetch(url) returns bytes or None."""
+def refresh(cache_file: Path, fetch, now: float | None = None, *, force: bool = False) -> bool:
+    """Refresh periodically, or on demand no more than once per 12 hours; fetch(url) returns bytes or None."""
     global _articles
     now = time.time() if now is None else now
     with _lock:
@@ -105,7 +106,8 @@ def refresh(cache_file: Path, fetch, now: float | None = None) -> bool:
         except (OSError, ValueError):
             cached = {}
         cached_at = cached.get("updated_at", 0)
-        if isinstance(cached_at, (int, float)) and 0 <= now - cached_at < REFRESH_SECONDS:
+        age = now - cached_at if isinstance(cached_at, (int, float)) else None
+        if age is not None and 0 <= age < (FORCED_REFRESH_MIN_SECONDS if force else REFRESH_SECONDS):
             _articles = cached.get("articles") or []
             replace(_articles, cached_at)
             return False

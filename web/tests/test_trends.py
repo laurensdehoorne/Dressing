@@ -15,7 +15,7 @@ def test_trend_feed_parser_keeps_only_safe_fashion_articles():
     assert result[0]["description"] == "Rich textures & playful layers"
 
 
-def test_trends_cache_persists_and_refreshes_no_more_than_twice_daily(tmp_path):
+def test_trends_cache_persists_refreshes_monthly_and_limits_forced_refreshes(tmp_path):
     path = tmp_path / "fashion-trends.json"
     calls = []
 
@@ -35,4 +35,9 @@ def test_trends_cache_persists_and_refreshes_no_more_than_twice_daily(tmp_path):
     prompt, sources = trends.context()
     assert "Fashion trends 2026" in prompt and len(sources) == 2
     assert trends.refresh(path, fetch, now + trends.REFRESH_SECONDS + 1)
+    assert len(calls) == 2
+    calls.clear()
+    assert trends.refresh(path, fetch, now + trends.REFRESH_SECONDS + 2, force=True) is False
+    assert calls == []  # pressing the manual refresh again cannot fetch more than once per 12 hours
+    assert trends.refresh(path, fetch, now + trends.REFRESH_SECONDS + trends.FORCED_REFRESH_MIN_SECONDS + 2, force=True)
     assert len(calls) == 2
