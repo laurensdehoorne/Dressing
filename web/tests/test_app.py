@@ -160,6 +160,23 @@ def test_ai_learning_runs_in_background_at_most_once_per_month(client, monkeypat
     assert main._learning_due({"learning_dirty": True, "learning_ai_attempted_at": settings["learning_ai_attempted_at"]}) is False
 
 
+def test_background_ai_settings_control_frequency_and_disable(client):
+    state = client.get("/api/state").json()
+    assert state["background_ai"] == {"enabled": True, "interval_days": 30}
+    user = state["user"]
+    now = main.datetime(2026, 10, 25, tzinfo=main.timezone.utc)
+    prior = (now - main.timedelta(days=13)).isoformat()
+    base = {"learning_dirty": True, "learning_ai_attempted_at": prior}
+    assert main._learning_due({**base, "background_ai_interval_days": 7}, now)
+    assert not main._learning_due({**base, "background_ai_interval_days": 14}, now)
+    assert not main._learning_due({**base, "background_ai_enabled": False, "background_ai_interval_days": 7}, now)
+    assert client.put("/api/settings/background-ai", json={"enabled": False, "interval_days": 21}, headers=H).status_code == 200
+    saved = client.get("/api/state").json()["background_ai"]
+    assert saved == {"enabled": False, "interval_days": 21}
+    assert not main._learning_due({**base, **{"background_ai_enabled": saved["enabled"], "background_ai_interval_days": saved["interval_days"]}}, now)
+    assert client.put("/api/settings/background-ai", json={"enabled": True, "interval_days": 10}, headers=H).status_code == 400
+
+
 def test_worn_history_keeps_item_snapshots_after_item_deletion(client):
     item = add(client, name="Groene linnen blouse", colors=["groen"], brand="Atelier")
     worn = client.post("/api/worn", json={"item_ids": [item["id"]], "occasion": "zomerfeest"}, headers=H).json()

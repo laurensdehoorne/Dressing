@@ -948,6 +948,15 @@ function renderSettings() {
     <div class="pills" role="group" aria-label="Analyse" style="margin:14px 0 0">
       ${[["standaard", "Standaard"], ["zuinig", "Zuinig"]].map(([q, label]) => `<button data-act="set-quality" data-value="${q}" aria-pressed="${(S.ai?.quality || "standaard") === q}">${label}</button>`).join("")}</div>
     <p class="footnote">${qualityNote(service)}</p>
+    <h2 class="section-title">Achtergrond-AI</h2>
+    <div class="card">
+      <label class="row"><span class="grow">Alle achtergrond AI werk uit</span><input type="checkbox" data-act-change="background-ai-off" ${(S.background_ai?.enabled === false) ? "checked" : ""}></label>
+      <div class="field"><label for="s-background-ai-interval">Frequentie van AI-samenvatting</label>
+        <select id="s-background-ai-interval" data-act-change="background-ai-interval" ${S.background_ai?.enabled === false ? "disabled" : ""}>
+          ${[[7,"Wekelijks"],[14,"Om de 2 weken"],[21,"Om de 3 weken"],[30,"Maandelijks"]].map(([days,label]) => `<option value="${days}" ${(S.background_ai?.interval_days || 30) === days ? "selected" : ""}>${label}</option>`).join("")}
+        </select></div>
+    </div>
+    <p class="footnote">De AI vat je outfitgeschiedenis op deze frequentie samen als er nieuwe feedback is. Lokale verwerking blijft actief. Modetrends worden apart maandelijks opgehaald.</p>
     <p class="footnote">Maak een sleutel op ${h(service.console || "console.anthropic.com")}. Je kan voor beide diensten een sleutel bewaren
       en wisselen wanneer je wil; de herkenning en de stylist gebruiken de gekozen dienst. Een sleutel wordt versleuteld met je wachtwoord bewaard: niemand anders kan hem lezen.
       Een foto herkennen of een outfit vragen kost meestal minder dan een cent.</p>
@@ -1589,6 +1598,14 @@ const changes = {
     if (files.length) addInspiration(stack.at(-1), files);
   },
   "use-weather": (el) => { ui.stylist.useWeather = el.checked; },
+  async "background-ai-off"(el) {
+    const config = S.background_ai || { enabled: true, interval_days: 30 };
+    if (await mutate(() => api("/api/settings/background-ai", { method: "PUT", json: { enabled: !el.checked, interval_days: config.interval_days || 30 } }))) toast(el.checked ? "Achtergrond-AI uitgeschakeld" : "Achtergrond-AI ingeschakeld");
+  },
+  async "background-ai-interval"(el) {
+    const config = S.background_ai || { enabled: true, interval_days: 30 };
+    await mutate(() => api("/api/settings/background-ai", { method: "PUT", json: { enabled: config.enabled !== false, interval_days: Number(el.value) } }));
+  },
 };
 
 document.addEventListener("click", (e) => {

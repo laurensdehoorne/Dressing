@@ -401,6 +401,8 @@ def state(user: User):
             "trip": settings.get("trip"),
             "profile": settings.get("profile") or "",
             "style_profile": settings.get("style_profile") or "",
+            "background_ai": {"enabled": settings.get("background_ai_enabled", True),
+                              "interval_days": settings.get("background_ai_interval_days", 30)},
             "version": VERSION,
         }
 
@@ -501,6 +503,20 @@ class ProfileIn(BaseModel):
 def set_profile(body: ProfileIn, user: User):
     auth.put_user_setting(user, "profile", body.profile.strip()[:1500] or None)
     return {"ok": True}
+
+
+class BackgroundAIIn(BaseModel):
+    enabled: bool
+    interval_days: int
+
+
+@app.put("/api/settings/background-ai")
+def set_background_ai(body: BackgroundAIIn, user: User):
+    if body.interval_days not in {7, 14, 21, 30}:
+        raise HTTPException(400, "Kies wekelijks, om de 2 weken, om de 3 weken of maandelijks.")
+    auth.put_user_setting(user, "background_ai_enabled", body.enabled)
+    auth.put_user_setting(user, "background_ai_interval_days", body.interval_days)
+    return {"background_ai": {"enabled": body.enabled, "interval_days": body.interval_days}}
 
 
 class PlaceIn(BaseModel):
@@ -678,7 +694,7 @@ def _refresh_all_outfit_learning() -> None:
 
 
 def _learning_due(settings: dict, now: datetime | None = None) -> bool:
-    if not settings.get("learning_dirty"):
+    if not settings.get("background_ai_enabled", True) or not settings.get("learning_dirty"):
         return False
     try:
         attempted = datetime.fromisoformat(settings.get("learning_ai_attempted_at", ""))
@@ -687,7 +703,10 @@ def _learning_due(settings: dict, now: datetime | None = None) -> bool:
     except (TypeError, ValueError):
         attempted = None
     now = now or datetime.now(timezone.utc)
-    return attempted is None or now - attempted.astimezone(timezone.utc) >= LEARNING_INTERVAL
+    days = settings.get("background_ai_interval_days", 30)
+    if days not in {7, 14, 21, 30}:
+        days = 30
+    return attempted is None or now - attempted.astimezone(timezone.utc) >= timedelta(days=days)
 
 
 def _learning_input(worn: list[dict], rejected: list[dict], local_profile: str) -> str:
