@@ -509,6 +509,8 @@ def test_ask_how_the_outfit_was_in_the_evening():
 
 def test_outfit_question_goes_to_the_phone(client, monkeypatch):
     from datetime import datetime, timedelta, timezone
+    monkeypatch.setattr(push.socket, "getaddrinfo", lambda host, port, type: [
+        (push.socket.AF_INET, push.socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))])
     shirt = add(client, name="Wit hemd")
     sub = {"endpoint": "https://web.push.apple.com/abc", "keys": {"p256dh": "k", "auth": "a"}}
     assert client.post("/api/push/subscribe", json={"subscription": sub}, headers=H).json()["devices"][0]["device"]
@@ -525,6 +527,18 @@ def test_outfit_question_goes_to_the_phone(client, monkeypatch):
     asyncio.run(push.send_questions(datetime.now(timezone.utc) + timedelta(days=1)))
     assert len(sent) == 1  # asked once
     assert client.delete(f"/api/push/devices/{push.device_id(sub['endpoint'])}", headers=H).json()["devices"] == []
+
+
+def test_push_endpoints_reject_untrusted_hosts_and_private_dns(monkeypatch):
+    assert not push._valid_endpoint("https://127.0.0.1/secret")
+    assert not push._valid_endpoint("https://attacker.example/push")
+    assert not push._valid_endpoint("https://user@web.push.apple.com/push")
+    assert not push._valid_endpoint("https://web.push.apple.com:8443/push")
+    monkeypatch.setattr(push.socket, "getaddrinfo", lambda host, port, type: [
+        (push.socket.AF_INET, push.socket.SOCK_STREAM, 6, "", ("8.8.8.8", port)),
+        (push.socket.AF_INET, push.socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+    ])
+    assert not push._valid_endpoint("https://web.push.apple.com/push")
 
 
 def shot_png() -> bytes:

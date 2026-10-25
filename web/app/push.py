@@ -9,9 +9,12 @@ message is encrypted for that phone and posted there. (As in CellarPeaks' push.p
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import os
+import socket
 from datetime import datetime, time, timedelta, timezone
+from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import serialization
 from py_vapid import Vapid02
@@ -27,6 +30,24 @@ ASK_AFTER = timedelta(minutes=30)  # an outfit noted later in the evening: asked
 ASK_STALE = timedelta(hours=3)  # missed by a long restart: too late to still ask
 
 _vapid: Vapid02 | None = None
+PUSH_HOSTS = ("fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com",
+              "notify.windows.com", "wns.windows.com")
+
+
+def _valid_endpoint(endpoint: str) -> bool:
+    """Only accept HTTPS endpoints on browser push-provider domains with public DNS answers."""
+    if not endpoint or len(endpoint) > 8192:
+        return False
+    try:
+        parts = urlsplit(endpoint)
+        host = (parts.hostname or "").rstrip(".").lower()
+        if (parts.scheme != "https" or not host or parts.username or parts.password or parts.port not in (None, 443)
+                or parts.fragment or not any(host == allowed or host.endswith("." + allowed) for allowed in PUSH_HOSTS)):
+            return False
+        addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        return bool(addresses) and all(ipaddress.ip_address(row[4][0]).is_global for row in addresses)
+    except (OSError, UnicodeError, ValueError):
+        return False
 
 
 def vapid() -> Vapid02:
@@ -58,7 +79,7 @@ def device_id(endpoint: str) -> str:
 def save(user: dict, subscription: dict, device: str = "") -> None:
     endpoint = str(subscription.get("endpoint") or "")
     keys = subscription.get("keys") or {}
-    if not endpoint.startswith("https://") or not keys.get("p256dh") or not keys.get("auth"):
+    if not _valid_endpoint(endpoint) or not isinstance(keys, dict) or not keys.get("p256dh") or not keys.get("auth"):
         raise ValueError("Ongeldig abonnement op meldingen.")
     data = {"endpoint": endpoint, "keys": {"p256dh": str(keys["p256dh"]), "auth": str(keys["auth"])}}
     with db.connect() as conn:
