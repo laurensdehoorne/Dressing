@@ -635,6 +635,11 @@ function suggestions() {
     ${list.map(([emoji, text]) => `<button data-act="suggest" data-q="${h(text)}">${emoji} ${h(text)}</button>`).join("")}</div></div>`).join("");
 }
 
+// "www.vogue.co.uk/article/…" as "vogue.co.uk": a source's site, short enough for a footnote.
+function siteName(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return url; }
+}
+
 function outfitsHTML(r) {
   const piece = (id) => {
     const i = itemById(id);
@@ -649,6 +654,7 @@ function outfitsHTML(r) {
       : `Nog geen voorspelling voor ${h(name)}: de stylist gaat uit van het gebruikelijke weer daar`}</span></div>`;
   }).join("");
   return `${elsewhere}${r.advice ? `<p class="advice">${h(r.advice)}</p>` : ""}
+    ${r.trend_search ? `<p class="footnote">🔎 Trends opgezocht voor „${h(r.trend_search.topic)}” (${h(r.trend_search.date)})${r.trend_search.sources?.length ? `: ${r.trend_search.sources.slice(0, 5).map((s) => `<a href="${h(s.url)}" target="_blank" rel="noopener noreferrer" title="${h(s.title || s.url)}">${h(siteName(s.url))}</a>`).join(" · ")}` : ""}</p>` : ""}
     ${r.trend_sources?.length ? `<p class="footnote">Actuele trendartikelen (cache van ${h(r.trend_sources[0].updated)}): ${[...new Map(r.trend_sources.map((s) => [s.source, s])).values()].map((s) => `<a href="${h(s.url)}" target="_blank" rel="noopener noreferrer">${h(s.source)}</a>`).join(" · ")}</p>` : ""}
     ${r.outfits.map((o, n) => {
       const query = ui.stylist.thread.join(" → ") || ui.stylist.query;
@@ -986,9 +992,9 @@ function renderSettings() {
           ${[[7,"Wekelijks"],[14,"Om de 2 weken"],[21,"Om de 3 weken"],[30,"Maandelijks"]].map(([days,label]) => `<option value="${days}" ${(S.background_ai?.interval_days || 30) === days ? "selected" : ""}>${label}</option>`).join("")}
         </select></div>
     </div>
-    <p class="footnote">De AI vat je outfitgeschiedenis op deze frequentie samen als er nieuwe feedback is. Lokale verwerking blijft actief. Modetrends worden apart maandelijks opgehaald.</p>
+    <p class="footnote">De AI vat je outfitgeschiedenis op deze frequentie samen als er nieuwe feedback is. Lokale verwerking blijft actief. Modetrendkoppen worden wekelijks opgehaald; de stylist zoekt daarnaast zelf gericht trends op het web wanneer een vraag erom vraagt (gedeeld en een week bewaard per onderwerp).</p>
     <div class="card"><div class="row"><button class="row-button" data-act="refresh-learning-now" ${ui.learningRefreshBusy ? "disabled" : ""}>${ui.learningRefreshBusy ? "Geschiedenis en trends worden bijgewerkt…" : "Nu outfitgeschiedenis samenvatten en trends ophalen"}</button></div></div>
-    <p class="footnote">De AI-samenvatting gebruikt je ingestelde AI-dienst en kan API-kosten veroorzaken. Trends verversen maximaal eenmaal per 12 uur; normaal gebeurt dit maandelijks.</p>
+    <p class="footnote">De AI-samenvatting gebruikt je ingestelde AI-dienst en kan API-kosten veroorzaken. Trendkoppen verversen maximaal eenmaal per 12 uur; normaal gebeurt dit wekelijks. Een gerichte trendzoekopdracht van de stylist kost ongeveer een cent.</p>
     <p class="footnote">Maak een sleutel op ${h(service.console || "console.anthropic.com")}. Je kan voor beide diensten een sleutel bewaren
       en wisselen wanneer je wil; de herkenning en de stylist gebruiken de gekozen dienst. Een sleutel wordt versleuteld met je wachtwoord bewaard: niemand anders kan hem lezen.
       Een foto herkennen of een outfit vragen kost meestal minder dan een cent.</p>

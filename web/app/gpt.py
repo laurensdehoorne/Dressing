@@ -259,6 +259,40 @@ async def run_until_tool_call(user: dict, tool: dict, *, system: str, content: l
     raise ClaudeError("Geen resultaat ontvangen van ChatGPT. Probeer opnieuw.")
 
 
+# MARK: - A web search (the stylist's trends_zoeken)
+
+async def search_web(user: dict, system: str, question: str) -> tuple[str, list[dict]]:
+    """Asks the helper model with OpenAI's hosted web search; returns its summary and the pages it cites
+    ([{"title", "url"}], the url_citation annotations, else the sources it consulted)."""
+    name = HELPER_MODEL
+    try:
+        response = await _create(user, model=name, instructions=system, input=question, reasoning={"effort": "low"},
+                                 tools=[{"type": "web_search", "search_context_size": "low",
+                                         "user_location": {"type": "approximate", "country": "BE", "timezone": "Europe/Brussels"}}],
+                                 include=["web_search_call.action.sources"], max_output_tokens=4000)
+    except ClaudeError:
+        raise
+    except openai.OpenAIError as e:
+        if isinstance(e, openai.APITimeoutError):
+            costs.lost("openai", name, costs.TIMED_OUT)
+        raise _error(e)
+    costs.track_openai(name, response)
+    cited, consulted = [], []
+    for item in response.output or []:
+        kind = getattr(item, "type", None)
+        if kind == "message":
+            for part in getattr(item, "content", None) or []:
+                for note in getattr(part, "annotations", None) or []:
+                    if getattr(note, "type", None) == "url_citation":
+                        cited.append({"title": getattr(note, "title", "") or "", "url": getattr(note, "url", "") or ""})
+        elif kind == "web_search_call":
+            for source in getattr(getattr(item, "action", None), "sources", None) or []:
+                if url := getattr(source, "url", None):
+                    consulted.append({"title": "", "url": url})
+    unique = list({s["url"]: s for s in reversed(cited or consulted) if s["url"]}.values())[::-1]
+    return (getattr(response, "output_text", "") or "").strip(), unique
+
+
 # MARK: - A picture of an outfit
 
 DRAW_PROMPT = """Een realistische modefoto van één persoon die precies dit outfit draagt, van top tot teen, staand, het gezicht buiten beeld of afgewend, tegen een rustige effen achtergrond in daglicht.

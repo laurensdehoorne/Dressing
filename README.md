@@ -45,8 +45,12 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   Scores en afwijzingen bouwen lokaal een korte voorkeurssamenvatting op. Bij voldoende nieuwe feedback mag de stylist
   daar maximaal één helper-modelaanroep per 30 dagen aan besteden; die ene aanroep heeft een begrensde invoer en uitvoer
   en verschijnt apart in het AI-gebruiksoverzicht.
-- **Actuele trends**: de stylist haalt trendartikelen op van British Vogue en Who What Wear in een gedeelde cache,
-  hoogstens eens per 30 dagen. De titels en korte beschrijvingen gaan mee met de gewone outfitvraag; de bronlinks staan bij het advies.
+- **Actuele trends**: de stylist zoekt zelf gericht op het web naar trends voor de vraag (tool `trends_zoeken`: seizoen,
+  gelegenheid, jouw stijl en kleuren), met de zoekfunctie van de gekozen AI-dienst en zijn goedkope hulpmodel. Hoogstens één
+  zoekopdracht per vraag, niet bij puur praktische vragen of een bijsturing; een onderwerp wordt een week bewaard en gedeeld
+  tussen accounts (enkel het onderwerp gaat mee, niets over jou). Een zoekopdracht kost $10 per 1000 plus de tokens en staat
+  in het AI-gebruiksoverzicht. De gevonden bronnen staan bij het advies. Daarnaast haalt de app wekelijks trendkoppen op van
+  British Vogue en Who What Wear (zonder AI) die mee gaan met elke outfitvraag.
 - **Outfit rond dit stuk**: vanuit een kledingstuk meteen een outfit eromheen vragen.
 - **Inspiratie**: bewaar outfits die je mooi vindt op Instagram of Pinterest, met tot 6 screenshots tegelijk of de link van
   een pin (de server haalt de foto van de pin op; bij Instagram lukt dat zonder aanmelden niet, daar neem je een screenshot). De

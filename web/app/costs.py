@@ -5,7 +5,7 @@ response to record(), once: a continued conversation (a helper's answer, a nudge
 with its own usage, so it counts again. An analysis (recognising a piece, reading an order, the stylist) runs under a
 meter (main._analysis), which collects the calls it made and keeps them as one row in ai_usage. These are estimates:
 usage × list price. What the service really bills is in its own console.
-(The same as CellarPeaks' costs.py, without the web searches Dressing doesn't use.)
+Web searches (the stylist's trends_zoeken) are billed per search on top of the tokens (SEARCH_PER_1000).
 """
 
 import contextvars
@@ -64,6 +64,10 @@ PRICES = {
                       "long_context": {"above": 272_000, "input": 2.0, "output": 1.5}},
     },
 }
+# USD per 1000 web searches, on top of the tokens: the search results the model reads are already in the response's
+# input tokens. Anthropic's web_search tool and OpenAI's web_search tool (Responses API) both cost $10 per 1000
+# (checked October 2026); OpenAI doesn't bill opening a page or looking in it, only a search.
+SEARCH_PER_1000 = {"anthropic": 10.0, "openai": 10.0}
 # Both services bill in dollars; the app shows euros. Late September 2026: 1 USD = 0.87 EUR. An estimate.
 USD_TO_EUR = float(os.environ.get("USD_EUR", "0.87"))
 STANDARD_TIERS = {None, "", "default", "auto", "standard"}  # the service tier the prices above are for
@@ -112,6 +116,7 @@ class Call:
     cache_write_1h_tokens: int = 0  # of those, Anthropic's 1-hour cache
     cache_write_12h_tokens: int = 0  # of those, OpenAI's 12-hour cache
     output_tokens: int = 0  # reasoning included: billed as output
+    searches: int = 0  # web searches, billed per search
     cost_usd: float = 0.0
     # estimated: all usage and prices known · partial: a part couldn't be priced or wasn't reported (listed in
     # `missing`; the cost is then lower than the bill) · unknown: no usable usage, or no price.
@@ -157,7 +162,7 @@ def _priced(call: Call) -> Call:
             cost += tokens * p[key] * f_in
         elif tokens:
             _flag(call, label)
-    call.cost_usd = cost / 1_000_000
+    call.cost_usd = cost / 1_000_000 + call.searches * SEARCH_PER_1000.get(call.provider, 0.0) / 1000
     return call
 
 
@@ -174,6 +179,7 @@ def from_anthropic(model: str, usage) -> Call:
     call.cache_write_1h_tokens = min(_count(_get(usage, "cache_creation"), "ephemeral_1h_input_tokens") or 0, call.cache_write_tokens)
     call.input_tokens = plain + call.cache_write_tokens + call.cached_input_tokens
     call.output_tokens = out
+    call.searches = _count(_get(usage, "server_tool_use"), "web_search_requests") or 0
     call = _priced(call)
     if _get(usage, "service_tier") not in STANDARD_TIERS:
         _flag(call, f"service tier {_get(usage, 'service_tier')}: andere prijzen")
@@ -192,12 +198,12 @@ def anthropic_calls(requested: str, served: str, usage) -> list[Call]:
     return calls
 
 
-def from_openai(model: str, usage, service_tier: str | None = None) -> Call:
+def from_openai(model: str, usage, service_tier: str | None = None, searches: int = 0) -> Call:
     """OpenAI's Responses API usage: input_tokens is the whole prompt; input_tokens_details.cached_tokens and
     .cache_write_tokens are parts of it that don't overlap (a read is never also charged as a write), and
     .cache_write_tokens_details splits the writes by lifetime (ttl_30m_tokens, ttl_12h_tokens); output_tokens includes
     the reasoning tokens."""
-    call = Call("openai", model)
+    call = Call("openai", model, searches=searches)
     inp, out = _count(usage, "input_tokens"), _count(usage, "output_tokens")
     if inp is None or out is None:
         call.status, call.missing = "unknown", ["tokengebruik"]
@@ -241,10 +247,17 @@ def track_anthropic(requested: str, response) -> None:
         record(Call("anthropic", requested, status="unknown", missing=["kost kon niet berekend worden"]))
 
 
+def openai_searches(response) -> int:
+    """The billed web searches in a Responses API answer: web_search_call items whose action is a search (or doesn't
+    say what it is). Opening a page or looking in one isn't billed."""
+    return sum(1 for item in getattr(response, "output", None) or [] if _get(item, "type") == "web_search_call"
+               and (_get(_get(item, "action"), "type") or "search") == "search")
+
+
 def track_openai(requested: str, response) -> None:
     try:
         record(from_openai(getattr(response, "model", None) or requested, getattr(response, "usage", None),
-                           getattr(response, "service_tier", None)))
+                           getattr(response, "service_tier", None), openai_searches(response)))
     except Exception as e:
         print(f"cost of an OpenAI call: {e!r}")
         record(Call("openai", requested, status="unknown", missing=["kost kon niet berekend worden"]))
@@ -304,7 +317,7 @@ def summary(calls: list[Call]) -> dict:
     return {
         "input_tokens": total("input_tokens"), "output_tokens": total("output_tokens"),
         "cached_input_tokens": total("cached_input_tokens"), "cache_write_tokens": total("cache_write_tokens"),
-        "cost_usd": round(usd, 8), "cost_eur": round(usd * USD_TO_EUR, 6),
+        "searches": total("searches"), "cost_usd": round(usd, 8), "cost_eur": round(usd * USD_TO_EUR, 6),
         "status": _status(c.status for c in calls),
         "models": ", ".join(dict.fromkeys(c.model for c in calls)),
     }

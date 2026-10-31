@@ -548,8 +548,8 @@ async def _refresh_learning_and_trends(user: dict) -> dict:
         return bool(summary)
 
     def fetch(url: str) -> bytes | None:
-        result = _safe_get(url, 500_000, timeout=12)
-        return result[2] if result and result[0] == 200 and len(result[2]) <= 500_000 else None
+        result = _safe_get(url, trends.MAX_FEED_BYTES, timeout=12)
+        return result[2] if result and result[0] == 200 and len(result[2]) <= trends.MAX_FEED_BYTES else None
 
     async def refresh_trends() -> bool:
         return await asyncio.to_thread(trends.refresh, db.DATA_DIR / "fashion-trends.json", fetch, force=True)
@@ -1066,15 +1066,15 @@ async def _job_cleanup():
 
 
 async def _trend_refresh_loop():
-    """Refresh the shared fashion trend cache in the background at most every thirty days."""
+    """Refresh the shared fashion headline cache in the background every week (RSS only, no AI cost)."""
     cache_file = db.DATA_DIR / "fashion-trends.json"
     trends.restore(cache_file)
     await asyncio.to_thread(_refresh_all_outfit_learning)
     await asyncio.sleep(5)  # let the app start immediately; the current cache is used meanwhile
     while True:
         def fetch(url: str) -> bytes | None:
-            result = _safe_get(url, 500_000, timeout=12)
-            if not result or result[0] != 200 or len(result[2]) > 500_000:
+            result = _safe_get(url, trends.MAX_FEED_BYTES, timeout=12)
+            if not result or result[0] != 200 or len(result[2]) > trends.MAX_FEED_BYTES:
                 return None
             return result[2]
         try:
@@ -1760,9 +1760,34 @@ async def _stylist(user: dict, query: str, use_weather: bool, on_trip: bool = Fa
     if settings.get("color_profile"):
         learned += "\nKleurcorrecties van de gebruiker (volg deze expliciet): " + settings["color_profile"]
     trend_text, trend_sources = trends.context()
+    searched: list[dict] = []
+
+    async def trends_at(asked: dict) -> str:
+        """A targeted web search for trends (trends_zoeken): once per question, from the week's cache when the same
+        topic was searched before (by anyone: it's public fashion news)."""
+        topic = " ".join(str(asked.get("onderwerp") or "").split())[:160]
+        if not topic:
+            return "Geef een onderwerp."
+        if searched:
+            return "Je zocht al trends voor deze vraag; gebruik dat resultaat."
+        cache_file = db.DATA_DIR / "trend-searches.json"
+        entry = trends.cached_search(cache_file, topic)
+        cached = entry is not None
+        if entry is None:
+            claude.report(step=f"Trends opzoeken: {topic}")
+            brief, sources = await claude.search_trends(user, topic)
+            if not brief:
+                return "Niets bruikbaars gevonden. Kies zonder trend."
+            entry = trends.store_search(cache_file, topic, brief, sources)
+        searched.append({"topic": entry["topic"], "sources": entry["sources"], "cached": cached,
+                         "date": datetime.fromtimestamp(entry["at"], timezone.utc).strftime("%Y-%m-%d")})
+        return trends.search_answer(entry)
+
     result = await claude.suggest_outfits(user, query, items, worn, weather=weather_text, profile=settings.get("profile") or "",
-                                          style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None, trends=trend_text, learned=learned)
-    return {**result, "weather": forecast, "elsewhere": elsewhere, "trend_sources": trend_sources}
+                                          style=settings.get("style_profile") or "", packed=packed, trip=on_trip and bool(settings.get("trip")), rejected=rejected, previous=previous, weather_at=weather_at if use_weather and not on_trip else None, trends=trend_text, learned=learned,
+                                          trends_at=trends_at)
+    return {**result, "weather": forecast, "elsewhere": elsewhere, "trend_sources": trend_sources,
+            "trend_search": searched[0] if searched else None}
 
 
 class PictureIn(BaseModel):

@@ -501,7 +501,7 @@ def test_stylist_looks_up_the_weather_where_the_question_is_about(client, monkey
         async def create(self, **kwargs):
             sent.append(kwargs)
             if len(sent) == 1:
-                assert [t["name"] for t in kwargs["tools"]] == ["geef_outfits", "weer_opvragen"]
+                assert [t["name"] for t in kwargs["tools"]] == ["geef_outfits", "weer_opvragen", "trends_zoeken"]
                 call = SimpleNamespace(type="tool_use", id="t1", name="weer_opvragen", input={"plaats": "Amsterdam", "van": "2026-10-25"})
                 return SimpleNamespace(content=[call], stop_reason="tool_use")
             result = kwargs["messages"][-1]["content"][0]
