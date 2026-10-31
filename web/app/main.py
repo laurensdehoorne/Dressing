@@ -1916,13 +1916,29 @@ def _piece_text(item: dict) -> str:
     return ", ".join(str(p) for p in parts)
 
 
+_BIRTH_DATE = re.compile(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\b")
+
+
+def _drawn_person(about: str, today: date | None = None) -> str:
+    """How the user describes themself, for the person in an outfit picture: a birth date becomes an age."""
+    today = today or date.today()
+
+    def age(m: re.Match) -> str:
+        try:
+            born = date(int(m[3]), int(m[2]), int(m[1]))
+        except ValueError:
+            return ""
+        return f"{today.year - born.year - ((today.month, today.day) < (born.month, born.day))} jaar"
+    return " ".join(_BIRTH_DATE.sub(age, about).replace("geboortedatum", "leeftijd").split())[:600]
+
+
 async def _draw(user: dict, items: list[dict]):
     def photo(item: dict) -> bytes | None:
         file = db.PHOTO_DIR / f"{item['id']}.jpg"
         return file.read_bytes() if item.get("photo") and file.exists() else None
     pieces = [(_piece_text(i), await asyncio.to_thread(photo, i)) for i in items]
     claude.report(step="Beeld tekenen")
-    jpeg = await gpt.draw_outfit(user, pieces)
+    jpeg = await gpt.draw_outfit(user, pieces, _drawn_person(auth.user_settings(user).get("profile") or ""))
     return {"image": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}
 
 

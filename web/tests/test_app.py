@@ -1102,7 +1102,7 @@ def test_outfit_picture_only_of_own_pieces_and_only_when_asked(client, monkeypat
     jeans = add(client, name="Jeans", category="broek")
     drawn = []
 
-    async def fake_draw(user, pieces):
+    async def fake_draw(user, pieces, about=""):
         drawn.append(pieces)
         return b"\xff\xd8beeld"
     monkeypatch.setattr(gpt, "draw_outfit", fake_draw)
@@ -1138,6 +1138,28 @@ def test_drawing_needs_a_photo_and_an_openai_key(monkeypatch):
     monkeypatch.setattr(gpt.keys, "active_key", lambda user, name="claude": ("sk-test", "app"))
     with pytest.raises(claude.ClaudeError, match="foto"):
         asyncio.run(gpt.draw_outfit(user, [("Wit hemd", None)]))
+
+
+def test_the_person_in_a_picture_is_the_user_as_they_describe_themself(client, monkeypatch):
+    import asyncio
+    from datetime import date
+    from types import SimpleNamespace
+    assert main._drawn_person("Vrouw, geboortedatum 12/12/1990. Mama van twee kinderen.", date(2026, 10, 31)) \
+        == "Vrouw, leeftijd 35 jaar. Mama van twee kinderen."
+    sent = []
+
+    class FakeImages:
+        async def edit(self, **kwargs):
+            sent.append(kwargs)
+            return SimpleNamespace(data=[SimpleNamespace(b64_json="/9g=")], usage=None)
+    monkeypatch.setattr(gpt, "client", lambda user: SimpleNamespace(images=FakeImages()))
+    monkeypatch.setattr(gpt.keys, "active_key", lambda user, name="claude": ("sk-test", "app"))
+    monkeypatch.setattr(gpt.costs, "track_openai_image", lambda *a: None)
+    user = {"id": "u", "is_admin": False}
+    asyncio.run(gpt.draw_outfit(user, [("Wit hemd", b"x")], "Vrouw, leeftijd 35 jaar."))
+    assert "Vrouw, leeftijd 35 jaar." in sent[0]["prompt"] and "niemand anders in beeld" in sent[0]["prompt"]
+    asyncio.run(gpt.draw_outfit(user, [("Wit hemd", b"x")]))
+    assert "zichzelf beschrijft" not in sent[1]["prompt"]
 
 
 def test_cost_of_a_picture_and_of_astra():

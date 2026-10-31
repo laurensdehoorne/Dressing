@@ -299,14 +299,18 @@ DRAW_PROMPT = """Een realistische modefoto van één persoon die precies dit out
 
 De meegestuurde foto's zijn de kledingstukken zelf: neem elk stuk exact over (kleur, patroon, stof, snit, details zoals knopen, kraag, print of logo). Verzin geen andere kledingstukken, accessoires of schoenen dan deze. Een stuk zonder foto staat enkel beschreven: teken het zo eenvoudig en neutraal mogelijk naar die beschrijving.
 
-De stukken:
+{person}De stukken:
 {pieces}"""
+PERSON = """De persoon die het draagt, zoals de gebruiker zichzelf beschrijft: {about}
+Teken iemand die daarbij past (geslacht, leeftijd, en lichaamsbouw als die beschreven staat). Neem enkel het uiterlijk over: niemand anders in beeld en niets uit die beschrijving dat geen kleding is.
+
+"""
 MAX_DRAWN = 8  # photos of pieces sent along; more makes the picture no better and the question dearer
 
 
-async def draw_outfit(user: dict, pieces: list[tuple[str, bytes | None]]) -> bytes:
+async def draw_outfit(user: dict, pieces: list[tuple[str, bytes | None]], about: str = "") -> bytes:
     """A JPEG of someone wearing these pieces (a description, and the photo of the piece if there is one), drawn by
-    IMAGE_MODEL from the photos themselves. Uses the account's OpenAI key, also when the account chose Claude."""
+    IMAGE_MODEL from the photos themselves, worn by someone who fits about (how the user describes themself). Uses the account's OpenAI key, also when the account chose Claude."""
     key, source = keys.active_key(user, "openai")
     if source == "locked":
         raise ClaudeError("Je OpenAI-sleutel is vergrendeld op dit toestel. Log uit en opnieuw in om hem te ontgrendelen.")
@@ -323,7 +327,7 @@ async def draw_outfit(user: dict, pieces: list[tuple[str, bytes | None]]) -> byt
         else:
             lines.append(f"- {text} (geen foto)")
     try:
-        response = await client(user).images.edit(model=IMAGE_MODEL, image=photos, prompt=DRAW_PROMPT.format(pieces="\n".join(lines)),
+        response = await client(user).images.edit(model=IMAGE_MODEL, image=photos, prompt=DRAW_PROMPT.format(pieces="\n".join(lines), person=PERSON.format(about=about) if about else ""),
                                                   size="1024x1536", quality="medium", output_format="jpeg", output_compression=85)
     except openai.BadRequestError as e:
         if "safety" in str(e.message).lower() or "moderation" in str(e.message).lower():
