@@ -962,6 +962,7 @@ function renderSettings() {
       <span class="muted" aria-hidden="true">›</span></div></div>
     <div class="card" style="margin-top:12px"><div class="row"><button class="row-button" data-act="liked-list">♡ Bewaarde voorstellen
       <span class="muted small" style="display:block">${plural((S.liked_outfits || []).length, "outfit", "outfits")} die je mooi vindt</span></button><span class="muted" aria-hidden="true">›</span></div></div>
+    ${detailsSection()}
     <h2 class="section-title">Weer</h2>
     <form class="card" data-act-submit="save-place">
       <div class="field"><label for="s-place">Woonplaats</label><input id="s-place" name="place" value="${h(S.place?.name || "")}" placeholder="bv. Kortrijk"></div>
@@ -1011,7 +1012,20 @@ function renderSettings() {
     <p class="footnote" style="margin-top:24px;text-align:center">Dressing${S.version ? ` · versie ${h(S.version)}` : ""}</p>`;
 }
 
-const TASKS = { herkennen: "Foto herkennen", bestelling: "Bestelling lezen", stylist: "Stylist", inspiratie: "Inspiratie",
+/** Pieces the stylist knows too little about (often read from an order mail): described again from their photo. */
+function detailsSection() {
+  const n = S.enrich_candidates || 0, busy = ui.fillDetails;
+  if (!n && !busy) return "";
+  return `<h2 class="section-title">Je dressing</h2>
+    <div class="card"><div class="row"><button class="row-button" data-act="fill-details" ${busy || !aiReady() ? "disabled" : ""}>${busy
+      ? h(busy.step || "Stukken aanvullen…")
+      : `✨ ${plural(n, "stuk", "stukken")} aanvullen vanuit de foto`}
+      <span class="muted small" style="display:block">${busy ? "Dit duurt ongeveer een minuut; je kan verder werken."
+        : "Gelegenheden, stijl, pasvorm, materiaal en een beschrijving ontbreken: de stylist weet er te weinig over."}</span></button></div></div>
+    <p class="footnote">De AI bekijkt de foto van elk stuk en vult enkel lege velden aan; wat je zelf invulde blijft. Kost ongeveer een tiende cent per stuk.</p>`;
+}
+
+const TASKS = { herkennen: "Foto herkennen", "stukken aanvullen": "Stukken aanvullen", bestelling: "Bestelling lezen", stylist: "Stylist", inspiratie: "Inspiratie",
   outfitbeeld: "Outfitbeeld" };
 
 // ChatGPT on its default model (Luna): may the stylist call in Sol for a dress code and Astra for a second try, or
@@ -1378,6 +1392,19 @@ const actions = {
     render();
   },
   "worn-all": () => { ui.wornMonth = ""; render(); },
+  async "fill-details"() {
+    if (ui.fillDetails) return;
+    ui.fillDetails = { step: "" };
+    render();
+    try {
+      const r = await slowApi("/api/items/fill-details", { method: "POST" }, (p) => {
+        if (p.step && ui.fillDetails) { ui.fillDetails.step = p.step; if (ui.tab === "settings" && !stack.length) render(); }
+      });
+      await load();
+      toast(`${plural(r.pieces, "stuk", "stukken")} aangevuld (${plural(r.fields, "veld", "velden")})${r.failed ? ` · ${r.failed} niet gelukt` : ""}`);
+    } catch (e) { toast(e.message); }
+    finally { ui.fillDetails = null; render(); }
+  },
   async "refresh-learning-now"() {
     if (ui.learningRefreshBusy) return;
     ui.learningRefreshBusy = true;

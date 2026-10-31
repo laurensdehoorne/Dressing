@@ -408,6 +408,7 @@ def state(user: User):
             "style_profile": settings.get("style_profile") or "",
             "color_profile": settings.get("color_profile") or "",
             "learned_colors": _learned_color_profile(items, worn, rejected, liked),
+            "enrich_candidates": sum(1 for i in items if _needs_details(i)),
             "background_ai": {"enabled": settings.get("background_ai_enabled", True),
                               "interval_days": settings.get("background_ai_interval_days", 30)},
             "version": VERSION,
@@ -686,6 +687,83 @@ async def set_item_photo(item_id: str, user: User, photo: UploadFile = File(...)
         (db.PHOTO_DIR / f"{item_id}.jpg").write_bytes(jpeg)
         conn.execute("UPDATE items SET has_photo = 1 WHERE id = ?", (item_id,))
         return db.item_row(_get_item(conn, item_id, user))
+
+
+# MARK: - Filling in thin pieces from their photo
+
+# What the stylist reads to tell pieces apart, beyond name, colour and the 1-5 scores: a piece with few of these (often
+# one read from an order mail, which rarely says more) is described again from its own photo.
+DETAIL_FIELDS = ("occasions", "style_tags", "description", "fit", "material", "pattern")
+# What that description may fill in: only fields that are still empty, never what the user (or an earlier
+# recognition) put there, and never the name, category, colours or brand that identify the piece.
+FILLABLE_FIELDS = ("kind", "pattern", "material", "fit", "seasons", "warmth", "formality", "occasions", "style_tags",
+                   "description")
+MAX_ENRICH = 60  # pieces per run; a bigger dressing takes another tap
+ENRICH_AT_ONCE = 4
+
+
+def _empty(value) -> bool:
+    return value in (None, "", [])
+
+
+def _needs_details(item: dict) -> bool:
+    """A piece with a photo that misses at least half of what the stylist reads, and wasn't filled in before."""
+    return bool(item.get("photo")) and not item.get("details_filled_at") \
+        and sum(_empty(item.get(k)) for k in DETAIL_FIELDS) >= len(DETAIL_FIELDS) // 2
+
+
+def _details_hint(item: dict) -> str:
+    """What is known already, so the description matches the piece (the photo may show more than one)."""
+    known = [item.get("name") or item.get("kind") or ""]
+    for key, label in (("kind", "soort"), ("brand", "merk"), ("material", "materiaal"), ("fit", "pasvorm")):
+        if item.get(key):
+            known.append(f"{label}: {item[key]}")
+    if item.get("colors"):
+        known.append("kleur: " + "/".join(item["colors"]))
+    return "Dit stuk zit al in de dressing (" + "; ".join(k for k in known if k) + "). Beschrijf het volledig vanaf de foto."
+
+
+@app.post("/api/items/fill-details")
+async def fill_details(user: AIUser, request: Request):
+    """Describes the thin pieces again from their own photo and fills in only what is empty (DETAIL_FIELDS)."""
+    with db.connect() as conn:
+        items = [db.item_row(r) for r in conn.execute("SELECT * FROM items WHERE user_id = ? ORDER BY date_added", (user["id"],))]
+    todo = [i for i in items if _needs_details(i)][:MAX_ENRICH]
+    if not todo:
+        raise HTTPException(400, "Alle stukken met een foto zijn al goed beschreven.")
+    return await _background(request, user, _analysis(user, "stukken aanvullen", _fill_details(user, todo)))
+
+
+async def _fill_details(user: dict, todo: list[dict]) -> dict:
+    done, filled, failed, errors = 0, 0, 0, []
+    gate = asyncio.Semaphore(ENRICH_AT_ONCE)
+    claude.report(step=f"Stukken aanvullen: 0 van {len(todo)}")
+
+    async def one(item: dict) -> None:
+        nonlocal done, filled, failed
+        async with gate:
+            try:
+                jpeg = await asyncio.to_thread((db.PHOTO_DIR / f"{item['id']}.jpg").read_bytes)
+                got = await claude.identify_item(user, jpeg, _details_hint(item))
+            except (OSError, claude.ClaudeError) as e:
+                failed += 1
+                errors.append(e)
+            else:
+                with db.connect() as conn:  # read again: the user may have changed the piece in the meantime
+                    row = conn.execute("SELECT data FROM items WHERE id = ? AND user_id = ?", (item["id"], user["id"])).fetchone()
+                    if row:
+                        data = json.loads(row["data"])
+                        new = {k: got[k] for k in FILLABLE_FIELDS if not _empty(got.get(k)) and _empty(data.get(k))}
+                        data.update(new)
+                        data["details_filled_at"] = db.now_iso()  # tried once: not offered again
+                        conn.execute("UPDATE items SET data = ? WHERE id = ?", (json.dumps(data), item["id"]))
+                        filled += len(new)
+            done += 1
+            claude.report(step=f"Stukken aanvullen: {done} van {len(todo)}")
+    await asyncio.gather(*(one(i) for i in todo))
+    if failed == len(todo) and errors:
+        raise errors[0]  # nothing worked (a wrong key, no credit): say why
+    return {"pieces": len(todo) - failed, "fields": filled, "failed": failed}
 
 
 # MARK: - Worn (outfits that were worn)

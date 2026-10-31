@@ -51,6 +51,9 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   tussen accounts (enkel het onderwerp gaat mee, niets over jou). Een zoekopdracht kost $10 per 1000 plus de tokens en staat
   in het AI-gebruiksoverzicht. De gevonden bronnen staan bij het advies. Daarnaast haalt de app wekelijks trendkoppen op van
   British Vogue en Who What Wear (zonder AI) die mee gaan met elke outfitvraag.
+- **Stukken aanvullen**: stukken met een foto die weinig info hebben (vaak ingelezen uit een bestelmail) laat je onder
+  Instellingen in één keer opnieuw beschrijven vanaf hun foto. Enkel lege velden worden ingevuld (gelegenheden, stijl,
+  pasvorm, materiaal, patroon, beschrijving, ...); naam, categorie, kleur, merk en wat je zelf invulde blijven.
 - **Outfit rond dit stuk**: vanuit een kledingstuk meteen een outfit eromheen vragen.
 - **Inspiratie**: bewaar outfits die je mooi vindt op Instagram of Pinterest, met tot 6 screenshots tegelijk of de link van
   een pin (de server haalt de foto van de pin op; bij Instagram lukt dat zonder aanmelden niet, daar neem je een screenshot). De
