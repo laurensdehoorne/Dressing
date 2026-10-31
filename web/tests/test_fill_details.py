@@ -109,3 +109,31 @@ def test_progress_counts_pieces_not_photos(client, monkeypatch):
         return await main._fill_details(user, todo)
     assert asyncio.run(run())["pieces"] == 2
     assert steps == ["Stukken aanvullen: 0 van 2", "Stukken aanvullen: 1 van 2", "Stukken aanvullen: 2 van 2"]
+
+
+def test_what_could_not_be_seen_is_left_out():
+    got = claude.without_guesses({
+        "material": "gebreid, materiaal onbekend", "pattern": "effen", "fit": "niet vermeld",
+        "kind": "laarzen", "description": "Zwarte midi-jurk met bandjes. Combineert mooi met sandalen; het merk is niet zichtbaar op de foto."})
+    assert got["material"] == "gebreid" and got["pattern"] == "effen" and got["fit"] == "" and got["kind"] == "laarzen"
+    assert got["description"] == "Zwarte midi-jurk met bandjes. Combineert mooi met sandalen."
+    clear = "Kort jasje; de stof oogt als tweed, niet als duidelijke pailletten."
+    assert claude.without_guesses({"description": clear})["description"] == clear
+    assert claude.without_guesses({"material": "niet met zekerheid te bepalen; glanzende, lederachtige afwerking"})["material"] \
+        == "glanzende, lederachtige afwerking"
+
+
+def test_pieces_filled_in_before_are_cleaned_once(client, monkeypatch):
+    from app import main
+    filled = _with_photo(client, **THIN)
+    mine = add(client, name="Eigen stuk", material="onbekend")  # the user's own words: left alone
+
+    async def fake_identify(user, photo, hint):
+        return {**SEEN, "fit": "niet vermeld", "description": "Kort leren jack. Merk niet zichtbaar op de foto."}
+    monkeypatch.setattr(claude, "identify_item", fake_identify)
+    client.post("/api/items/fill-details", headers=H)
+    assert main._clean_recognitions() == 1 and main._clean_recognitions() == 0
+    items = {i["id"]: i for i in client.get("/api/state").json()["items"]}
+    assert "fit" not in items[filled["id"]] or not items[filled["id"]]["fit"]
+    assert items[filled["id"]]["description"] == "Kort leren jack." and items[filled["id"]]["material"] == "leer"
+    assert items[mine["id"]]["material"] == "onbekend"

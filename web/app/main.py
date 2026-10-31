@@ -45,6 +45,7 @@ _learning_tasks: dict[str, asyncio.Task] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
+    _clean_recognitions()
     tasks = [asyncio.create_task(_daily_maintenance()), asyncio.create_task(_job_cleanup()),
              asyncio.create_task(push.question_loop()), asyncio.create_task(_trend_refresh_loop())]
     yield
@@ -721,6 +722,22 @@ def _details_hint(item: dict) -> str:
     if item.get("colors"):
         known.append("kleur: " + "/".join(item["colors"]))
     return "Dit stuk zit al in de dressing (" + "; ".join(k for k in known if k) + "). Beschrijf het volledig vanaf de foto."
+
+
+def _clean_recognitions() -> int:
+    """Once for pieces filled in before recognitions were cleaned: drops "onbekend" and "merk niet zichtbaar" from what
+    the AI filled in. Only pieces it filled in (details_filled_at); doing it again changes nothing."""
+    changed = 0
+    with db.connect() as conn:
+        for row in conn.execute("SELECT id, data FROM items").fetchall():
+            data = json.loads(row["data"])
+            if not data.get("details_filled_at"):
+                continue
+            clean = {k: v for k, v in claude.without_guesses(data).items() if not _empty(v) or _empty(data[k])}
+            if clean != data:
+                conn.execute("UPDATE items SET data = ? WHERE id = ?", (json.dumps(clean), row["id"]))
+                changed += 1
+    return changed
 
 
 @app.post("/api/items/fill-details")

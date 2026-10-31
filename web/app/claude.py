@@ -5,6 +5,7 @@ import asyncio
 import base64
 import contextvars
 import os
+import re
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 from datetime import date, timedelta
@@ -223,7 +224,29 @@ async def identify_item(user: dict, photo_jpeg: bytes | None, hint: str | None) 
         "occasions": got.get("gelegenheden"), "style_tags": got.get("stijl"), "description": got.get("beschrijving"),
         "care": got.get("onderhoud"),
     })
-    return {k: v for k, v in info.items() if v not in (None, "", [])}
+    return {k: v for k, v in without_guesses(info).items() if v not in (None, "", [])}
+
+
+# What a recognition writes when it can't tell ("onbekend", "het merk is niet zichtbaar op de foto"): no value, and
+# noise for the stylist, who reads every description.
+_UNSURE = re.compile(r"\b(onbekend|niet (vermeld|zichtbaar|duidelijk|leesbaar|af te leiden|zeker|met zekerheid)|"
+                     r"volgens de omschrijving|detailfoto)\b", re.I)
+GUESSABLE = ("kind", "pattern", "material", "fit", "care")
+
+
+def without_guesses(info: dict) -> dict:
+    """Drops the parts of a recognition that only say what couldn't be seen; the rest stays as it was."""
+    out = dict(info)
+    for key in GUESSABLE:
+        if isinstance(out.get(key), str) and _UNSURE.search(out[key]):
+            out[key] = ", ".join(p.strip() for p in re.split(r"[;,]", out[key]) if p.strip() and not _UNSURE.search(p))
+    text = out.get("description")
+    if isinstance(text, str) and _UNSURE.search(text):
+        pieces = re.split(r"(;\s*|(?<=[.!?])\s+)", text)
+        kept = "".join(seg + sep for seg, sep in zip(pieces[0::2], pieces[1::2] + [""])
+                       if seg.strip() and not _UNSURE.search(seg)).strip().rstrip(";").strip()
+        out["description"] = kept + ("." if kept and kept[-1] not in ".!?" else "")
+    return out
 
 
 # MARK: - Reading an order confirmation
@@ -236,7 +259,7 @@ def _order_piece(got: dict, shop: str, day: str) -> dict:
         "formality": got.get("formaliteit"), "occasions": got.get("gelegenheden"), "style_tags": got.get("stijl"),
         "description": got.get("beschrijving"), "price": got.get("prijs"), "purchase_date": day,
     })
-    return {k: v for k, v in info.items() if v not in (None, "", [])}
+    return {k: v for k, v in without_guesses(info).items() if v not in (None, "", [])}
 
 
 def _image(jpeg: bytes) -> dict:
@@ -630,7 +653,8 @@ Roep precies één keer de tool registreer_kledingstuk aan. Regels:
 - seizoenen uit lente, zomer, herfst, winter: wanneer je het draagt.
 - gelegenheden: 2 tot 5 concrete momenten (bv. "kantoor", "weekend", "etentje", "feest", "wandelen", "sport").
 - stijl: 2 tot 5 korte stijltermen (bv. "klassiek", "minimalistisch", "sportief", "bohemian", "preppy").
-- beschrijving: 1 à 2 zinnen over hoe het eruitziet en waarmee het goed combineert."""
+- beschrijving: 1 à 2 zinnen over hoe het eruitziet en waarmee het goed combineert. Niets over het merk of over wat je niet kan zien.
+- Wat je niet kan zien of afleiden, laat je weg: schrijf nooit "onbekend", "niet vermeld" of "niet zichtbaar" in een veld."""
 
 ITEM_TOOL = {
     "name": "registreer_kledingstuk",
