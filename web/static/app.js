@@ -1083,6 +1083,27 @@ function costsSection() {
 // MARK: - Notifications (Web Push), as in CellarPeaks
 
 const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+// The service worker (offline shell, notifications) is a nice-to-have: when it can't be registered (a browser that
+// doesn't allow it, or the server restarting during an update) the app works on without it, without an error
+// message, and tries once more half a minute later.
+const workerReady = !("serviceWorker" in navigator) ? Promise.resolve(null) : (async () => {
+  for (const wait of [0, 30_000]) {
+    await new Promise((done) => setTimeout(done, wait));
+    try {
+      await navigator.serviceWorker.register("/sw.js");
+      return await navigator.serviceWorker.ready;
+    } catch (e) {
+      console.warn("service worker not registered:", e);
+    }
+  }
+  return null;
+})();
+/** The registered service worker, for notifications; a clear message when this browser has none. */
+async function serviceWorker() {
+  const reg = await workerReady;
+  if (!reg) throw new Error("Meldingen werken niet in deze browser. Probeer het in Safari of Chrome, of vanaf je beginscherm.");
+  return reg;
+}
 const standalone = () => window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
 // An iPad says it is a Mac (with a touch screen).
 const onIOS = () => !/Android/.test(navigator.userAgent)
@@ -1092,7 +1113,7 @@ const onIOS = () => !/Android/.test(navigator.userAgent)
 async function checkPush() {
   ui.push = { ...(ui.push || {}), checked: true };
   try {
-    const reg = await navigator.serviceWorker.ready;
+    const reg = await serviceWorker();
     const sub = await reg.pushManager.getSubscription();
     ui.push.here = !!sub;
     // Same handle as the server's: the first 16 hex characters of the endpoint's SHA-256.
@@ -1510,14 +1531,14 @@ const actions = {
     const permission = await Notification.requestPermission();
     if (permission !== "granted") throw new Error(onIOS() ? "Meldingen zijn niet toegestaan. Zet ze aan bij Instellingen op je iPhone → Meldingen → Dressing."
       : "Meldingen zijn niet toegestaan. Zet ze aan bij de instellingen van je browser of gsm.");
-    const reg = await navigator.serviceWorker.ready;
+    const reg = await serviceWorker();
     const { key } = await api("/api/push/key");
     const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBytes(key) });
     await api("/api/push/subscribe", { method: "POST", json: { subscription: sub.toJSON() } });
     toast("Meldingen staan aan");
   }),
   "push-off": () => pushAction(async () => {
-    const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription();
+    const reg = await serviceWorker(), sub = await reg.pushManager.getSubscription();
     if (sub) {
       await api("/api/push/unsubscribe", { method: "POST", json: { endpoint: sub.endpoint } });
       await sub.unsubscribe();
@@ -1764,7 +1785,6 @@ addEventListener("scroll", () => updateBars(), { passive: true });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && ui.auth?.user && !stack.length) load(); });
 window.addEventListener("unhandledrejection", (e) => { console.error(e.reason); toast(`Er liep iets mis: ${e.reason?.message || e.reason}`); });
 
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
 navigator.serviceWorker?.addEventListener("message", (e) => { if (typeof e.data?.open === "string" && ui.auth?.user) openFromNotification(e.data.open); });
 boot().then(() => {
   const what = location.hash.slice(1);
