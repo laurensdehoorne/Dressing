@@ -83,3 +83,29 @@ def test_when_nothing_works_the_reason_is_shown(client, monkeypatch):
     monkeypatch.setattr(claude, "identify_item", fake_identify)
     r = client.post("/api/items/fill-details", headers=H)
     assert r.status_code == 502 and "API-sleutel is ongeldig" in r.json()["detail"]
+
+
+def test_progress_counts_pieces_not_photos(client, monkeypatch):
+    import asyncio
+    from app import db, main
+    _with_photo(client, **THIN)
+    _with_photo(client, **{**THIN, "name": "Tweede jas"})
+    steps = []
+
+    async def fake_identify(user, photo, hint):
+        claude.report(step="Foto bekijken")  # what the real one reports
+        return dict(SEEN)
+    monkeypatch.setattr(claude, "identify_item", fake_identify)
+
+    class Shown(dict):  # what the app's progress shows, step by step
+        def update(self, changes):
+            steps.append(changes["step"])
+    with db.connect() as conn:
+        user = dict(conn.execute("SELECT * FROM users").fetchone())
+    todo = client.get("/api/state").json()["items"]
+
+    async def run():
+        claude.PROGRESS.set(Shown())
+        return await main._fill_details(user, todo)
+    assert asyncio.run(run())["pieces"] == 2
+    assert steps == ["Stukken aanvullen: 0 van 2", "Stukken aanvullen: 1 van 2", "Stukken aanvullen: 2 van 2"]

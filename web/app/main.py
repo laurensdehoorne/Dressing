@@ -744,7 +744,11 @@ async def _fill_details(user: dict, todo: list[dict]) -> dict:
         async with gate:
             try:
                 jpeg = await asyncio.to_thread((db.PHOTO_DIR / f"{item['id']}.jpg").read_bytes)
-                got = await claude.identify_item(user, jpeg, _details_hint(item))
+                quiet = claude.PROGRESS.set({})  # its own "Foto bekijken" would hide the count
+                try:
+                    got = await claude.identify_item(user, jpeg, _details_hint(item))
+                finally:
+                    claude.PROGRESS.reset(quiet)
             except (OSError, claude.ClaudeError) as e:
                 failed += 1
                 errors.append(e)
