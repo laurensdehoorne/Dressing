@@ -640,7 +640,7 @@ function outfitsHTML(r) {
     const i = itemById(id);
     if (!i) return "";
     return `<button class="piece" data-act="open" data-id="${h(id)}">${i.photo ? `<img src="${h(small(i.photo))}" alt="">` : `<span class="ph">${ic("shirt")}</span>`}
-      <span>${h(i.name)}</span><small>${ic("pin").replace('class="ic"', 'class="ic" style="width:11px;height:11px;vertical-align:-1px"')} ${h(i.location || "geen plaats")}</small></button>`;
+      <span>${h(i.name)}</span>${i.location ? `<small>${ic("pin").replace('class="ic"', 'class="ic" style="width:11px;height:11px;vertical-align:-1px"')} ${h(i.location)}</small>` : ""}</button>`;
   };
   // The weather the stylist looked up for the place the question is about, e.g. an outing to Amsterdam.
   const elsewhere = (r.elsewhere || []).map((w) => {
