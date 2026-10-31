@@ -47,7 +47,8 @@ via Tailscale. Hij is gebouwd op dezelfde basis als de Wijnkelder (CellarPeaks).
   en verschijnt apart in het AI-gebruiksoverzicht.
 - **Actuele trends**: de stylist zoekt zelf gericht op het web naar trends voor de vraag (tool `trends_zoeken`: seizoen,
   gelegenheid, jouw stijl en kleuren), met de zoekfunctie van de gekozen AI-dienst en zijn goedkope hulpmodel. Hoogstens één
-  zoekopdracht per vraag, niet bij puur praktische vragen of een bijsturing; een onderwerp wordt een week bewaard en gedeeld
+  zoekopdracht per vraag, en enkel als de vraag over een look, trends of een gelegenheid gaat (een feest, een etentje,
+  een dresscode), niet bij een gewone werkdag, het weer alleen of een bijsturing; een onderwerp wordt een week bewaard en gedeeld
   tussen accounts (enkel het onderwerp gaat mee, niets over jou). Een zoekopdracht kost $10 per 1000 plus de tokens en staat
   in het AI-gebruiksoverzicht. De gevonden bronnen staan bij het advies. Daarnaast haalt de app wekelijks trendkoppen op van
   British Vogue en Who What Wear (zonder AI) die mee gaan met elke outfitvraag.

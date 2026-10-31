@@ -374,6 +374,18 @@ DEMANDING = ("dresscode", "dress code", "black tie", "white tie", "cocktail", "g
              "maak deze look na", "chiquer")
 
 
+# A question where a current trend can make the outfit better: a look, an occasion, an outing. Not a working day or
+# the weather alone: a search costs about a cent, more than the question itself.
+_TREND_QUESTION = re.compile(r"\b(trend\w*|mode|modieu\w*|hip\w*|modern\w*|stijlvol\w*|look\w*|eigentijd\w*|feest\w*|"
+                             r"etentje|restaurant|date|uitgaan|uitje|festival|concert|verjaardag|kerst\w*|nieuwjaar|"
+                             r"oudejaar\w*|citytrip|stedentrip|brunch|aperitief|apero\w*|inspiratie|nieuw\w*)\b", re.I)
+
+
+def wants_trends(query: str) -> bool:
+    """Whether the stylist may search the web for trends for this question (trends_zoeken)."""
+    return bool(_TREND_QUESTION.search(query or "")) or demanding(query)
+
+
 def demanding(query: str, previous: dict | None = None) -> bool:
     """Whether this question (or the one it adjusts) is about a dress code or a look to recreate."""
     asked = " ".join([query, *((previous or {}).get("queries") or [])]).lower()
@@ -387,11 +399,14 @@ def _rejected_line(r: dict, names: dict[str, str]) -> str:
     return line + (": " + ", ".join(why) if why else "")
 
 
-def _item_line(item: dict, wear: dict, refused: dict[str, int] | None = None) -> str:
+def _item_line(item: dict, wear: dict, refused: dict[str, int] | None = None, ref: str = "") -> str:
     """One piece for the stylist: only what it needs to choose, to keep the question small. refused: how often each
-    piece was in an outfit the user turned down."""
-    parts = [item["id"], db.CATEGORIES.get(item.get("category"), "?")]
-    parts += [item.get(k) for k in ("kind", "name") if item.get(k)]
+    piece was in an outfit the user turned down. ref: the short number it goes by in this question (an id of 36
+    characters costs about 25 tokens, 144 pieces 3.000)."""
+    parts = [ref or item["id"], db.CATEGORIES.get(item.get("category"), "?")]
+    name, kind = item.get("name") or "", item.get("kind") or ""
+    parts += [kind] if kind and kind.lower() not in name.lower() else []
+    parts += [name] if name else []
     if item.get("colors"):
         parts.append("kleur " + "/".join(item["colors"]))
     for key in ("pattern", "material", "fit"):
@@ -407,19 +422,28 @@ def _item_line(item: dict, wear: dict, refused: dict[str, int] | None = None) ->
         parts.append("voor " + ", ".join(item["occasions"][:5]))
     if item.get("style_tags"):
         parts.append("stijl " + ", ".join(item["style_tags"][:5]))
-    if item.get("description"):
-        parts.append(_short(item["description"], 160))
+    if look := _appearance(item.get("description")):
+        parts.append(look)
     if item.get("notes"):
         parts.append(f"notitie '{_short(item['notes'], 100)}'")
     if item.get("favorite"):
         parts.append("favoriet")
-    if w := wear.get(item["id"]):
+    if w := wear.get(item["id"]):  # nothing said: never worn (the list says so once)
         parts.append(f"{w['count']}× gedragen, laatst {w['last']}")
-    else:
-        parts.append("nog nooit gedragen")
     if n := (refused or {}).get(item["id"]):
         parts.append(f"{n}× in een afgewezen outfit")
     return " | ".join(str(p) for p in parts)
+
+
+# A description's styling tip ("Combineert mooi met een jeans") is the stylist's own job: only how the piece looks goes along.
+_TIP = re.compile(r"^(combineer\w*|mooi (bij|om|over|onder|met)|draag\w*|past (bij|goed|mooi)|leuk (bij|met|om)|ideaal)\b", re.I)
+
+
+def _appearance(description) -> str:
+    """The first sentence of a description that says how the piece looks, at most 140 characters."""
+    sentences = re.split(r"(?<=[.!?])\s+|;\s*", " ".join(str(description or "").split()))
+    look = next((x for x in sentences if x and not _TIP.match(x)), "")
+    return _short(look, 140)
 
 
 def _short(text: str, limit: int) -> str:
@@ -528,7 +552,11 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         for item_id in r.get("item_ids", []):
             refused_count[item_id] = refused_count.get(item_id, 0) + 1
     where = "Mijn valies: ik ben op reis en heb enkel dit bij me" if packed is not None else "Mijn dressing"
-    wardrobe = f"{where} (één stuk per regel, id vooraan):\n" + "\n".join(_item_line(i, wear, refused_count) for i in available)
+    # Short numbers instead of the ids of 36 characters: s1, s2, ... in this question, translated back in the answer.
+    ref = {i["id"]: f"s{n}" for n, i in enumerate(available, 1)}
+    real = {v: k for k, v in ref.items()}
+    wardrobe = (f"{where} (één stuk per regel, id vooraan; staat er niet hoe vaak gedragen, dan nog nooit):\n"
+                + "\n".join(_item_line(i, wear, refused_count, ref[i["id"]]) for i in available))
     if style:
         wardrobe = f"Mijn stijl, uit outfits die ik mooi vind:\n{style}\n\n{wardrobe}"
     if profile:
@@ -547,7 +575,7 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
     if trip:
         question += "\nOp reis telt enkel het weer op mijn bestemming, niet het seizoen."
     helpers: Helpers = {WEATHER_TOOL["name"]: (WEATHER_TOOL, weather_at)} if weather_at else {}
-    if trends_at and not previous:  # a follow-up adjusts the suggestion, it doesn't look for new trends
+    if trends_at and not previous and wants_trends(query):  # a follow-up adjusts, a practical question needs no trends
         helpers[TRENDS_TOOL["name"]] = (TRENDS_TOOL, trends_at)
     if weather_at:
         question += ("\nGaat de vraag over een andere plaats dan hierboven (een uitstap, een reis, een feest elders) of over "
@@ -556,7 +584,7 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
         asked = " → ".join(previous.get("queries") or [])
         shown = []
         for n, o in enumerate(previous.get("outfits") or [], 1):
-            pieces = ", ".join(f"{i} ({names[i]})" for i in o.get("item_ids", []) if i in names)
+            pieces = ", ".join(f"{ref.get(i, i)} ({names[i]})" for i in o.get("item_ids", []) if i in names)
             shown.append(f"Outfit {n} '{o.get('title') or ''}': {pieces}")
         question += f"\nEerder vroeg ik: {asked}\nJe stelde voor:\n" + "\n".join(shown)
         question += ("\nIk stuur je voorstel bij. Geef alle outfits uit je voorstel terug, in dezelfde volgorde, en pas in elk "
@@ -571,6 +599,7 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
     report(step="Outfits samenstellen voor deze dresscode" if complex_ else "Outfits samenstellen")
     got = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=content, helpers=helpers,
                             effort="medium" if complex_ else "low", tier="complex" if complex_ else ""))
+    got = _real_ids(got, real)
     by_id = {i["id"]: i for i in available}
     refused_sets = [frozenset(r.get("item_ids", [])) for r in rejected]
     expected = len((previous or {}).get("outfits") or [])
@@ -578,16 +607,24 @@ async def suggest_outfits(user: dict, query: str, items: list[dict], worn: list[
     if problems:
         # Asked once more with what is wrong, of the strongest model (tier "review"); kept when it is better.
         report(step="Outfits nakijken")
-        shown = "\n".join(f"Outfit {n} '{o['title']}': " + ", ".join(f"{i} ({names[i]})" for i in o["item_ids"])
+        shown = "\n".join(f"Outfit {n} '{o['title']}': " + ", ".join(f"{ref[i]} ({names[i]})" for i in o["item_ids"])
                           for n, o in enumerate(outfits, 1)) or "geen bruikbare outfits"
         fix = (f"Je antwoord:\n{shown}\n\nDat klopt niet:\n" + "\n".join(f"- {p}" for p in problems) +
                "\n\nRoep geef_outfits opnieuw aan met alle outfits, verbeterd. Verander verder niets aan wat goed was.")
         again = await _timed(_ask(user, OUTFIT_TOOL, system=STYLIST_SYSTEM, content=[*content, {"type": "text", "text": fix}],
                                   helpers=helpers, tier="review"))
+        again = _real_ids(again, real)
         better, left = _outfits(again, by_id, expected, refused_sets)
         if better and len(left) < len(problems):
             got, outfits = again, better
     return {"advice": got.get("advies") or "", "outfits": outfits, "missing": got.get("ontbreekt") or ""}
+
+
+def _real_ids(got: dict, real: dict[str, str]) -> dict:
+    """The stylist's answer with the short numbers (s1, s2) back as the pieces' ids; anything else stays as given."""
+    outfits = [{**o, "stukken": [real.get(str(i).strip(), str(i)) for i in o.get("stukken") or []]} if isinstance(o, dict) else o
+               for o in got.get("outfits") or []]
+    return {**got, "outfits": outfits}
 
 
 def _outfits(got: dict, by_id: dict[str, dict], expected: int = 0, refused: list[frozenset] = ()) -> tuple[list[dict], list[str]]:

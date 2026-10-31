@@ -2,6 +2,7 @@
 
 import io
 import os
+import re
 import tempfile
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
@@ -501,7 +502,7 @@ def test_stylist_looks_up_the_weather_where_the_question_is_about(client, monkey
         async def create(self, **kwargs):
             sent.append(kwargs)
             if len(sent) == 1:
-                assert [t["name"] for t in kwargs["tools"]] == ["geef_outfits", "weer_opvragen", "trends_zoeken"]
+                assert [t["name"] for t in kwargs["tools"]] == ["geef_outfits", "weer_opvragen"]  # a practical question: no trends
                 call = SimpleNamespace(type="tool_use", id="t1", name="weer_opvragen", input={"plaats": "Amsterdam", "van": "2026-10-25"})
                 return SimpleNamespace(content=[call], stop_reason="tool_use")
             result = kwargs["messages"][-1]["content"][0]
@@ -879,7 +880,7 @@ def test_follow_up_adjusts_the_earlier_suggestion(client, monkeypatch):
         "queries": ["etentje", "iets chiquer"], "outfits": [{"title": "Smart casual", "item_ids": [hemd["id"], sneakers["id"]]}]}}, headers=H)
     assert r.status_code == 200, r.text
     q = seen["question"]
-    assert "Eerder vroeg ik: etentje → iets chiquer" in q and f"{sneakers['id']} (Witte sneakers)" in q
+    assert "Eerder vroeg ik: etentje → iets chiquer" in q and re.search(r"\bs\d+ \(Witte sneakers\)", q)
     assert "Bijsturing: andere schoenen" in q and "Vraag:" not in q
     client.post("/api/stylist", json={"query": "etentje", "use_weather": False}, headers=H)
     assert "Vraag: etentje" in seen["question"] and "Eerder vroeg ik" not in seen["question"]
@@ -976,10 +977,11 @@ def test_stylist_sees_what_a_piece_is_for_and_what_was_worn_lately(client, monke
         return {"advies": "", "outfits": []}
     monkeypatch.setattr(claude, "_ask", fake_ask)
     client.post("/api/stylist", json={"query": "kantoor", "use_weather": False}, headers=H)
-    line = next(l for l in seen["text"].splitlines() if l.startswith(hemd["id"]))
+    line = next(l for l in seen["text"].splitlines() if "| Wit hemd |" in l)
+    assert hemd["id"] not in seen["text"] and line.startswith("s")  # short numbers, not the long ids
     assert "voor kantoor, etentje" in line and "Strak hemd, mooi onder een blazer." in line and "notitie 'Knelt wat aan de kraag'" in line
     assert "2× in een afgewezen outfit" in line
-    assert "1× in een afgewezen outfit" in next(l for l in seen["text"].splitlines() if l.startswith(jeans["id"]))
+    assert "1× in een afgewezen outfit" in next(l for l in seen["text"].splitlines() if "| Jeans |" in l)
     worn = seen["text"].split("Mijn gedragen outfitgeschiedenis, lokaal samengevat:\n")[1].split("\n\n")[0]
     assert "Alle 3 gedragen outfits zijn verwerkt" in worn
     assert "Jeans 3×" in worn  # old, unrated outfits also contribute to all-time counts
@@ -1171,3 +1173,26 @@ def test_cost_of_a_picture_and_of_astra():
     astra = costs.from_openai("gpt-6-astra", {"input_tokens": 1000, "output_tokens": 100,
                                               "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}})
     assert astra.cost_usd == pytest.approx((1000 * 10.0 + 100 * 50.0) / 1_000_000)
+
+
+def test_the_stylist_gets_a_lean_list_and_answers_with_short_numbers(client, monkeypatch):
+    jas = add(client, name="Zwarte leren jas", category="jas", kind="leren jas",
+              description="Getailleerd zwart leren jack met rits. Combineert mooi met een jeans; het past bij alles.")
+    trui = add(client, name="Ecru trui", category="trui", kind="cardigan")
+    seen = {}
+
+    async def fake_ask(user, tool, *, system, content, effort="low", helpers=None, helper=False, tier=""):
+        seen["text"], seen["helpers"] = content[0]["text"], helpers or {}
+        refs = {name: l.split(" | ")[0] for l in content[0]["text"].splitlines() for name in ("Zwarte leren jas", "Ecru trui") if f"| {name}" in l}
+        return {"advies": "", "outfits": [{"titel": "A", "stukken": [refs["Zwarte leren jas"], refs["Ecru trui"]]}]}
+    monkeypatch.setattr(claude, "_ask", fake_ask)
+    r = client.post("/api/stylist", json={"query": "werkdag op kantoor", "use_weather": False}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["outfits"][0]["item_ids"] == [jas["id"], trui["id"]]  # the short numbers back as ids
+    jas_line = next(l for l in seen["text"].splitlines() if "Zwarte leren jas" in l)
+    assert "| leren jas |" not in jas_line  # the kind is already in the name
+    assert "| cardigan | Ecru trui" in seen["text"]
+    assert "Getailleerd zwart leren jack met rits." in jas_line and "Combineert" not in jas_line
+    assert "nog nooit gedragen" not in seen["text"] and "trends_zoeken" not in seen["helpers"]
+    assert claude.wants_trends("etentje op restaurant") and claude.wants_trends("iets trendy voor zaterdag")
+    assert not claude.wants_trends("werkdag op kantoor, comfortabel maar verzorgd") and not claude.wants_trends("luie zondag")
